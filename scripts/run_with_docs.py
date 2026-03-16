@@ -11,6 +11,7 @@ Requires OPENAI_API_KEY in the environment.
 """
 
 import argparse
+import hashlib
 import sys
 import time
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from llama_index.core import Document, VectorStoreIndex, Settings
 from llama_index.core.schema import MetadataMode, QueryBundle
+from llama_index.core.node_parser import SentenceSplitter
 from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.openai import OpenAIEmbedding
 
@@ -35,7 +37,7 @@ class Strategy:
     """In-memory representation of a chunking strategy."""
 
     id: str
-    kind: str  # for now only "llm"
+    kind: str  # "builtin_splitter" (no LLM) or "llm"
     instruction: str
 
 
@@ -97,33 +99,57 @@ def _extract_file_content(path: Path) -> tuple[str | None, str]:
         return None, f"Error reading {path}: {e}"
 
 
+def _content_hash(content: str) -> str:
+    """SHA-256 hash of document content for deduplication."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
 def load_documents(path: Path) -> list[Document]:
     """Load supported files from a file or directory into LlamaIndex Documents.
 
+    For a directory, scans the entire directory tree recursively (all subdirectories).
     Supports .txt, .md, .pdf, .docx. Other text-like files are best-effort.
+    Documents with identical content (same hash) are loaded only once.
     """
     path = path.resolve()
     if not path.exists():
         raise FileNotFoundError(f"Path not found: {path}")
 
     docs: list[Document] = []
+    seen_hashes: set[str] = set()
+
     if path.is_file():
         content, desc = _extract_file_content(path)
         if content:
-            docs.append(Document(text=content, id_=path.name))
+            h = _content_hash(content)
+            docs.append(
+                Document(
+                    text=content,
+                    id_=path.name,
+                    metadata={"content_hash": h},
+                )
+            )
         else:
             raise FileNotFoundError(f"Unable to read file {path}: {desc}")
     else:
-        # Include common doc types
-        candidates = list(path.rglob("*"))
-        for f in sorted(
-            p
-            for p in candidates
-            if p.is_file() and p.suffix.lower() in {".txt", ".md", ".pdf", ".docx"}
-        ):
+        # Recursively scan whole tree (all subdirectories)
+        candidates = sorted(path.rglob("*"))
+        for f in (p for p in candidates if p.is_file() and p.suffix.lower() in {".txt", ".md", ".pdf", ".docx"}):
             content, desc = _extract_file_content(f)
             if content:
-                docs.append(Document(text=content, id_=f.name))
+                h = _content_hash(content)
+                if h in seen_hashes:
+                    print(f"[SKIP] Duplicate content (same hash): {f.relative_to(path)}", file=sys.stderr)
+                    continue
+                seen_hashes.add(h)
+                doc_id = str(f.relative_to(path))
+                docs.append(
+                    Document(
+                        text=content,
+                        id_=doc_id,
+                        metadata={"content_hash": h},
+                    )
+                )
             else:
                 print(f"[WARN] Skipping {f}: {desc}", file=sys.stderr)
         if not docs:
@@ -135,11 +161,21 @@ def load_documents(path: Path) -> list[Document]:
 def build_index_for_strategies(
     strategies: list[Strategy],
     docs: list[Document],
-) -> tuple[VectorStoreIndex, list[Document]]:
+) -> tuple[VectorStoreIndex, list]:
     """Run all active strategies over docs and build a combined index."""
-    all_nodes = []
+    from llama_index.core.schema import BaseNode
+
+    all_nodes: list[BaseNode] = []
     for s in strategies:
-        if s.kind == "llm":
+        if s.kind == "builtin_splitter":
+            parser = SentenceSplitter(chunk_size=1024, chunk_overlap=20)
+            nodes = parser.get_nodes_from_documents(docs)
+            for n in nodes:
+                n.metadata = getattr(n, "metadata", None) or {}
+                n.metadata["strategy"] = s.id
+                n.metadata.setdefault("source_doc", getattr(n, "ref_doc_id", ""))
+            all_nodes.extend(nodes)
+        elif s.kind == "llm":
             parser = LLMNodeParser(
                 strategy_id=s.id,
                 strategy_instruction=s.instruction,
@@ -266,12 +302,12 @@ def main() -> None:
     parser.add_argument(
         "--strategy-id",
         default="s_sections",
-        help="Strategy id for chunk metadata (default: s_sections)",
+        help="Strategy id for optional LLM strategy (used only with --strategy)",
     )
     parser.add_argument(
         "--strategy",
-        default="Split the document by its structural divisions: chapters, headings, and subheadings. Each chunk is one section.",
-        help="Chunking strategy instruction for the LLM",
+        default=None,
+        help="If set, add an LLM chunking strategy (instruction text). Default is no LLM; uses LlamaIndex SentenceSplitter only.",
     )
     parser.add_argument(
         "--query",
@@ -303,10 +339,18 @@ def main() -> None:
     docs = load_documents(args.path)
     print(f"Loaded {len(docs)} document(s) from {args.path}")
 
-    # Start with a single LLM strategy based on CLI args
+    # Default: LlamaIndex SentenceSplitter only (no LLM). Optional: add one LLM strategy if --strategy given.
     strategies: list[Strategy] = [
-        Strategy(id=args.strategy_id, kind="llm", instruction=args.strategy),
+        Strategy(
+            id="s_default",
+            kind="builtin_splitter",
+            instruction="Sentence-based splitting (LlamaIndex default, chunk_size=1024)",
+        ),
     ]
+    if args.strategy:
+        strategies.append(
+            Strategy(id=args.strategy_id, kind="llm", instruction=args.strategy),
+        )
 
     index, nodes = build_index_for_strategies(strategies, docs)
     print(f"ReChunk produced {len(nodes)} nodes across {len(strategies)} strategy(ies)")
