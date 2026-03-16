@@ -1,0 +1,18 @@
+ReChunk Sample Document
+
+## What is ReChunk?
+
+ReChunk is an adaptive, feedback-driven RAG chunking system. Unlike static chunking, it treats the index as a function of your corpus and a set of chunking strategies.
+
+## Strategy Layers
+
+Each strategy is a natural-language instruction. An LLM performs the chunking. Chunks are tagged by strategy so you can combine multiple strategies in one index.
+
+## How to Run
+
+From the project root, with OPENAI_API_KEY set:
+
+  python scripts/run_with_docs.py docs
+  python scripts/run_with_docs.py docs --query "What is ReChunk?"
+
+You can also point at a single file: scripts/run_with_docs.py docs/sample.txt

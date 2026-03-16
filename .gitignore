@@ -24,5 +24,10 @@ htmlcov/
 *.swp
 *.swo
 
+# Env / secrets (never commit API keys)
+.env
+.env.local
+*.env
+
 # OS
 .DS_Store

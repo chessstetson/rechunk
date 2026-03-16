@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""
+Run ReChunk on a set of documents: load docs, chunk with an LLM strategy, build index, query.
+
+Usage:
+  python scripts/run_with_docs.py <path>                    # chunk + index, then remind to use --query
+  python scripts/run_with_docs.py <path> --query "?"        # one query with retrieval + LLM feedback
+  python scripts/run_with_docs.py <path> --interactive       # chunk + index once, then prompt for questions
+
+Requires OPENAI_API_KEY in the environment.
+"""
+
+import argparse
+import sys
+import time
+from pathlib import Path
+
+# Project root on path so "rechunk" resolves when run as script
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from llama_index.core import Document, VectorStoreIndex, Settings
+from llama_index.core.schema import MetadataMode, QueryBundle
+from llama_index.llms.openai import OpenAI
+from llama_index.embeddings.openai import OpenAIEmbedding
+
+from rechunk import LLMNodeParser
+
+# Max characters of chunk text to show in retrieval feedback
+CHUNK_PREVIEW_LEN = 280
+
+
+def _extract_file_content(path: Path) -> tuple[str | None, str]:
+    """Extract text content from supported file types.
+
+    Returns (content, description). content is None if the file type isn't supported
+    or required libraries are missing.
+    """
+    import os
+
+    ext = path.suffix.lower()
+    file_size = path.stat().st_size
+
+    try:
+        if ext == ".pdf":
+            try:
+                import PyPDF2  # type: ignore[import]
+
+                with path.open("rb") as f:
+                    reader = PyPDF2.PdfReader(f)
+                    text_parts: list[str] = []
+                    for page in reader.pages:
+                        page_text = page.extract_text() or ""
+                        text_parts.append(page_text)
+                content = "\n".join(text_parts)
+                return content, f"PDF document ({file_size:,} bytes)"
+            except ImportError:
+                print(f"[WARN] PyPDF2 not installed; skipping PDF {path}", file=sys.stderr)
+                return None, "PDF document (PyPDF2 not installed)"
+
+        if ext == ".docx":
+            try:
+                import docx  # type: ignore[import]
+
+                doc = docx.Document(str(path))
+                paragraphs = [p.text for p in doc.paragraphs]
+                content = "\n".join(paragraphs)
+                return content, f"Word document ({file_size:,} bytes)"
+            except ImportError:
+                print(f"[WARN] python-docx not installed; skipping DOCX {path}", file=sys.stderr)
+                return None, "Word document (python-docx not installed)"
+
+        # Plain text-like files
+        if ext in {".txt", ".md"}:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            return text, f"Text file ({ext})"
+
+        # Fallback: try as text
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if text.strip():
+                return text, f"Unknown text file ({ext})"
+        except Exception:
+            pass
+
+        return None, f"Unsupported or binary file ({ext})"
+    except Exception as e:
+        return None, f"Error reading {path}: {e}"
+
+
+def load_documents(path: Path) -> list[Document]:
+    """Load supported files from a file or directory into LlamaIndex Documents.
+
+    Supports .txt, .md, .pdf, .docx. Other text-like files are best-effort.
+    """
+    path = path.resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Path not found: {path}")
+
+    docs: list[Document] = []
+    if path.is_file():
+        content, desc = _extract_file_content(path)
+        if content:
+            docs.append(Document(text=content, id_=path.name))
+        else:
+            raise FileNotFoundError(f"Unable to read file {path}: {desc}")
+    else:
+        # Include common doc types
+        candidates = list(path.rglob("*"))
+        for f in sorted(
+            p
+            for p in candidates
+            if p.is_file() and p.suffix.lower() in {".txt", ".md", ".pdf", ".docx"}
+        ):
+            content, desc = _extract_file_content(f)
+            if content:
+                docs.append(Document(text=content, id_=f.name))
+            else:
+                print(f"[WARN] Skipping {f}: {desc}", file=sys.stderr)
+        if not docs:
+            raise FileNotFoundError(f"No supported files under {path}")
+
+    return docs
+
+
+def run_query_with_feedback(
+    index: VectorStoreIndex,
+    query: str,
+    top_k: int = 5,
+) -> None:
+    """
+    Run retrieval (embedding comparison), show chunks + scores, then LLM synthesis.
+    Prints timing and explains cosine-similarity retrieval vs LLM "dress-up".
+    """
+    retriever = index.as_retriever(similarity_top_k=top_k)
+    query_bundle = QueryBundle(query_str=query)
+
+    # ---- Retrieval (embedding comparison) ----
+    print("\n" + "=" * 60)
+    print("RETRIEVAL (embedding comparison)")
+    print("=" * 60)
+    print(
+        "Your question is embedded, then compared to each chunk's embedding via"
+        " cosine similarity (higher score = more similar). No LLM call yet."
+    )
+    t0 = time.perf_counter()
+    nodes_with_scores = retriever.retrieve(query)
+    t1 = time.perf_counter()
+    print(f"  Time: {(t1 - t0) * 1000:.0f} ms")
+    print(f"  Top {len(nodes_with_scores)} chunks:")
+    for i, nws in enumerate(nodes_with_scores, 1):
+        node = nws.node
+        score = getattr(nws, "score", None)
+        score_str = f"  score={score:.4f}" if score is not None else "  (no score)"
+        if hasattr(node, "get_content"):
+            text = node.get_content(metadata_mode=MetadataMode.NONE)
+        else:
+            text = getattr(node, "text", str(node))
+        preview = (text[:CHUNK_PREVIEW_LEN] + "…") if len(text) > CHUNK_PREVIEW_LEN else text
+        source = getattr(node, "ref_doc_id", None) or (getattr(node, "metadata", None) or {}).get("source_doc", "?")
+        start = getattr(node, "start_char_idx", None)
+        end = getattr(node, "end_char_idx", None)
+        if start is not None and end is not None:
+            loc = f"  source={source!r}  chars {start}–{end}"
+        else:
+            loc = f"  source={source!r}  (position in doc not stored)"
+        print(f"    {i}.{score_str}{loc}")
+        print(f"       {preview!r}")
+    print()
+
+    # ---- LLM synthesis ----
+    print("=" * 60)
+    print("LLM RESPONSE (synthesis from retrieved chunks)")
+    print("=" * 60)
+    print("The LLM sees your question + the chunks above and produces an answer.")
+    engine = index.as_query_engine()
+    t2 = time.perf_counter()
+    response = engine.synthesize(query_bundle, nodes_with_scores)
+    t3 = time.perf_counter()
+    print(f"  Time: {(t3 - t2) * 1000:.0f} ms")
+    answer = getattr(response, "response", str(response))
+    print(f"  Answer: {answer}")
+    print()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Run ReChunk on documents: chunk with LLM strategy, build index, optional query."
+    )
+    parser.add_argument(
+        "path",
+        type=Path,
+        help="Path to a .txt file or directory containing .txt files",
+    )
+    parser.add_argument(
+        "--strategy-id",
+        default="s_sections",
+        help="Strategy id for chunk metadata (default: s_sections)",
+    )
+    parser.add_argument(
+        "--strategy",
+        default="Split the document by its structural divisions: chapters, headings, and subheadings. Each chunk is one section.",
+        help="Chunking strategy instruction for the LLM",
+    )
+    parser.add_argument(
+        "--query",
+        default=None,
+        help="If set, run this query against the index and print the response",
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="After chunking/indexing once, prompt for questions in a loop (fast retrieval feel)",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=5,
+        help="Number of chunks to retrieve per query (default: 5)",
+    )
+    parser.add_argument(
+        "--model",
+        default="gpt-4o-mini",
+        help="OpenAI model for chunking (default: gpt-4o-mini)",
+    )
+    args = parser.parse_args()
+
+    # Use OpenAI for LLM and embeddings (reads OPENAI_API_KEY from env)
+    Settings.llm = OpenAI(model=args.model, temperature=0.1)
+    Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
+
+    docs = load_documents(args.path)
+    print(f"Loaded {len(docs)} document(s) from {args.path}")
+
+    rechunk_parser = LLMNodeParser(
+        strategy_id=args.strategy_id,
+        strategy_instruction=args.strategy,
+    )
+    nodes = rechunk_parser.get_nodes_from_documents(docs)
+    print(f"ReChunk produced {len(nodes)} nodes")
+
+    index = VectorStoreIndex(nodes)
+    print("Index built (embeddings computed).")
+
+    if args.interactive:
+        print(f"\n{len(nodes)} chunks formed. Enter a question (or 'quit' / 'q' to exit). You'll see retrieval then LLM response each time.")
+        while True:
+            try:
+                q = input("\nYour question: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nBye.")
+                break
+            if not q or q.lower() in ("quit", "q", "exit"):
+                print("Bye.")
+                break
+            run_query_with_feedback(index, q, top_k=args.top_k)
+    elif args.query:
+        run_query_with_feedback(index, args.query, top_k=args.top_k)
+    else:
+        print("\nNo --query given. Use --query \"your question\" or --interactive to ask questions.")
+
+
+if __name__ == "__main__":
+    main()

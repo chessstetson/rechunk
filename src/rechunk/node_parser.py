@@ -22,13 +22,16 @@ Strategy: {strategy_instruction}
 Rules:
 - Each chunk must be self-contained enough to answer a question without requiring adjacent context
 - Include enough surrounding context in each chunk to make it meaningful in isolation
+- For each chunk you MUST provide start_char and end_char: the 0-based character indices of that chunk in the document. start_char is the index of the first character (inclusive), end_char is the index of the character after the last (exclusive). So document.substring(start_char, end_char) must equal the chunk content.
 - Return ONLY valid JSON. No preamble, no explanation.
 
 Response format:
 [
   {{
     "chunk_id": "unique string",
-    "content": "the chunk text",
+    "content": "the chunk text (must exactly match document from start_char to end_char)",
+    "start_char": 0,
+    "end_char": 142,
     "metadata": {{ "strategy": "{strategy_id}", "source_doc": "{doc_id}" }}
   }}
 ]
@@ -99,22 +102,39 @@ class LLMNodeParser(NodeParser):
                     {
                         "chunk_id": f"{doc_id}_fallback",
                         "content": text,
+                        "start_char": 0,
+                        "end_char": len(text),
                         "metadata": {"strategy": self.strategy_id, "source_doc": doc_id},
                     }
                 ]
+            doc_len = len(text)
             for c in chunks:
                 content = c.get("content", "")
                 meta = c.get("metadata") or {}
                 meta.setdefault("strategy", self.strategy_id)
                 meta.setdefault("source_doc", doc_id)
+                start_char_idx = c.get("start_char")
+                end_char_idx = c.get("end_char")
+                if start_char_idx is not None and end_char_idx is not None:
+                    try:
+                        start_char_idx = int(start_char_idx)
+                        end_char_idx = int(end_char_idx)
+                        if start_char_idx < 0 or end_char_idx > doc_len or start_char_idx >= end_char_idx:
+                            start_char_idx = end_char_idx = None
+                    except (TypeError, ValueError):
+                        start_char_idx = end_char_idx = None
+                else:
+                    start_char_idx = end_char_idx = None
                 temp_node = TextNode(text=content)
                 chunk_id = c.get("chunk_id") or self.id_func(temp_node)
-                out.append(
-                    TextNode(
-                        id_=chunk_id,
-                        text=content,
-                        metadata=meta,
-                        ref_doc_id=doc_id,
-                    )
+                node = TextNode(
+                    id_=chunk_id,
+                    text=content,
+                    metadata=meta,
+                    ref_doc_id=doc_id,
                 )
+                if start_char_idx is not None and end_char_idx is not None:
+                    node.start_char_idx = start_char_idx
+                    node.end_char_idx = end_char_idx
+                out.append(node)
         return out

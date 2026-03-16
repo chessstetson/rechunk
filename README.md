@@ -16,7 +16,24 @@ pip install -e .
 
 Requires Python 3.10+. Optional: set `OPENAI_API_KEY` (or configure another LLM via LlamaIndex `Settings.llm`).
 
-## Quick start (v0.1 — single strategy)
+## Run with your own docs
+
+From the project root (with `OPENAI_API_KEY` set and the package installed, e.g. in a venv):
+
+```bash
+# Chunk a directory of .txt files (or a single .txt file)
+python scripts/run_with_docs.py path/to/your/docs
+
+# Chunk and run a query (with retrieval + LLM feedback: chunks, scores, then answer)
+python scripts/run_with_docs.py path/to/your/docs --query "What is the main idea?"
+
+# Interactive: chunk once, then ask questions in a loop (feel how fast embedding retrieval is)
+python scripts/run_with_docs.py path/to/your/docs --interactive
+```
+
+Use `docs` for the included sample. With `--query` or `--interactive`, the script shows **retrieval** (embedding cosine similarity, which chunks were picked, timing) and then the **LLM response** (synthesis from those chunks, timing). Options: `--strategy-id`, `--strategy`, `--model`, `--query`, `--interactive`, `--top-k`.
+
+## Quick start (v0.1 — single strategy, from code)
 
 ```python
 from llama_index.core import Document, VectorStoreIndex
