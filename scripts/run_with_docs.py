@@ -13,6 +13,7 @@ Requires OPENAI_API_KEY in the environment.
 import argparse
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 # Project root on path so "rechunk" resolves when run as script
@@ -27,6 +28,15 @@ from rechunk import LLMNodeParser
 
 # Max characters of chunk text to show in retrieval feedback
 CHUNK_PREVIEW_LEN = 280
+
+
+@dataclass
+class Strategy:
+    """In-memory representation of a chunking strategy."""
+
+    id: str
+    kind: str  # for now only "llm"
+    instruction: str
 
 
 def _extract_file_content(path: Path) -> tuple[str | None, str]:
@@ -120,6 +130,68 @@ def load_documents(path: Path) -> list[Document]:
             raise FileNotFoundError(f"No supported files under {path}")
 
     return docs
+
+
+def build_index_for_strategies(
+    strategies: list[Strategy],
+    docs: list[Document],
+) -> tuple[VectorStoreIndex, list[Document]]:
+    """Run all active strategies over docs and build a combined index."""
+    all_nodes = []
+    for s in strategies:
+        if s.kind == "llm":
+            parser = LLMNodeParser(
+                strategy_id=s.id,
+                strategy_instruction=s.instruction,
+            )
+            nodes = parser.get_nodes_from_documents(docs)
+            all_nodes.extend(nodes)
+    index = VectorStoreIndex(all_nodes)
+    return index, all_nodes
+
+
+def manage_strategies_interactively(strategies: list[Strategy]) -> None:
+    """Simple CLI to add/remove LLM strategies."""
+    while True:
+        print("\nCurrent strategies:")
+        for i, s in enumerate(strategies, 1):
+            print(f"  [{i}] {s.id}  (type={s.kind})  instruction={s.instruction!r}")
+        print(
+            "\nStrategy menu:\n"
+            "  [a] Add new LLM strategy\n"
+            "  [d] Delete a strategy\n"
+            "  [b] Back (no more changes)\n"
+        )
+        choice = input("Choice [a/d/b]: ").strip().lower()
+        if choice in ("b", "", "q", "exit"):
+            break
+        if choice == "a":
+            sid = input("New strategy id (e.g. s_procedures): ").strip()
+            if not sid:
+                print("No id entered; skipping.")
+                continue
+            instr = input("Strategy instruction (what semantic unit to chunk around): ").strip()
+            if not instr:
+                print("No instruction entered; skipping.")
+                continue
+            strategies.append(Strategy(id=sid, kind="llm", instruction=instr))
+            print(f"Added strategy {sid!r}.")
+        elif choice == "d":
+            idx_str = input("Enter number of strategy to delete (or blank to cancel): ").strip()
+            if not idx_str:
+                continue
+            try:
+                idx = int(idx_str)
+            except ValueError:
+                print("Invalid number.")
+                continue
+            if not (1 <= idx <= len(strategies)):
+                print("Out of range.")
+                continue
+            removed = strategies.pop(idx - 1)
+            print(f"Removed strategy {removed.id!r}.")
+        else:
+            print("Unknown choice; please enter a/d/b.")
 
 
 def run_query_with_feedback(
@@ -231,18 +303,20 @@ def main() -> None:
     docs = load_documents(args.path)
     print(f"Loaded {len(docs)} document(s) from {args.path}")
 
-    rechunk_parser = LLMNodeParser(
-        strategy_id=args.strategy_id,
-        strategy_instruction=args.strategy,
-    )
-    nodes = rechunk_parser.get_nodes_from_documents(docs)
-    print(f"ReChunk produced {len(nodes)} nodes")
+    # Start with a single LLM strategy based on CLI args
+    strategies: list[Strategy] = [
+        Strategy(id=args.strategy_id, kind="llm", instruction=args.strategy),
+    ]
 
-    index = VectorStoreIndex(nodes)
+    index, nodes = build_index_for_strategies(strategies, docs)
+    print(f"ReChunk produced {len(nodes)} nodes across {len(strategies)} strategy(ies)")
     print("Index built (embeddings computed).")
 
     if args.interactive:
-        print(f"\n{len(nodes)} chunks formed. Enter a question (or 'quit' / 'q' to exit). You'll see retrieval then LLM response each time.")
+        print(
+            f"\n{len(nodes)} chunks formed from {len(strategies)} strategy(ies). "
+            "Enter a question (or 'quit' / 'q' to exit). You'll see retrieval then LLM response each time."
+        )
         while True:
             try:
                 q = input("\nYour question: ").strip()
@@ -253,6 +327,17 @@ def main() -> None:
                 print("Bye.")
                 break
             run_query_with_feedback(index, q, top_k=args.top_k)
+            # Ask for feedback and optionally adjust strategies
+            fb = input(
+                "Was this answer correct? [y]es / [n]o / [i]ncomplete / [s]kip: "
+            ).strip().lower()
+            if fb in ("n", "i"):
+                manage_strategies_interactively(strategies)
+                # Rebuild index after any strategy changes
+                index, nodes = build_index_for_strategies(strategies, docs)
+                print(
+                    f"\nRebuilt index: {len(nodes)} chunks from {len(strategies)} strategy(ies)."
+                )
     elif args.query:
         run_query_with_feedback(index, args.query, top_k=args.top_k)
     else:
