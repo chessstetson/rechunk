@@ -69,72 +69,90 @@ class LLMNodeParser(NodeParser):
         show_progress: bool = False,
         **kwargs: Any,
     ) -> List[BaseNode]:
+        import sys
         from llama_index.core.utils import get_tqdm_iterable
 
         out: List[BaseNode] = []
-        items = get_tqdm_iterable(nodes, show_progress, "ReChunk (LLM)")
-        for node in items:
+        node_list = list(nodes)
+        total = len(node_list)
+        items = get_tqdm_iterable(node_list, show_progress, "ReChunk (LLM)")
+        for i, node in enumerate(items):
             doc_id = getattr(node, "id_", None) or getattr(node, "node_id", None) or ""
+            print(f"      [{i + 1}/{total}] {doc_id}", file=sys.stderr, flush=True)
             if hasattr(node, "text"):
                 text = node.text
             else:
                 text = node.get_content(metadata_mode=MetadataMode.NONE)
             if not text.strip():
                 continue
-            prompt = CHUNKING_PROMPT.format(
-                strategy_instruction=self.strategy_instruction,
-                strategy_id=self.strategy_id,
-                doc_id=doc_id,
-                document_text=text,
-            )
-            llm = self.llm
-            if llm is None:
-                from llama_index.core import Settings
-
-                llm = Settings.llm
-            response = llm.complete(prompt)
-            raw = str(response).strip()
             try:
-                chunks = _extract_json_array(raw)
-            except (json.JSONDecodeError, TypeError):
-                # Fallback: treat whole document as one chunk
-                chunks = [
-                    {
-                        "chunk_id": f"{doc_id}_fallback",
-                        "content": text,
-                        "start_char": 0,
-                        "end_char": len(text),
-                        "metadata": {"strategy": self.strategy_id, "source_doc": doc_id},
-                    }
-                ]
-            doc_len = len(text)
-            for c in chunks:
-                content = c.get("content", "")
-                meta = c.get("metadata") or {}
-                meta.setdefault("strategy", self.strategy_id)
-                meta.setdefault("source_doc", doc_id)
-                start_char_idx = c.get("start_char")
-                end_char_idx = c.get("end_char")
-                if start_char_idx is not None and end_char_idx is not None:
-                    try:
-                        start_char_idx = int(start_char_idx)
-                        end_char_idx = int(end_char_idx)
-                        if start_char_idx < 0 or end_char_idx > doc_len or start_char_idx >= end_char_idx:
-                            start_char_idx = end_char_idx = None
-                    except (TypeError, ValueError):
-                        start_char_idx = end_char_idx = None
-                else:
-                    start_char_idx = end_char_idx = None
-                temp_node = TextNode(text=content)
-                chunk_id = c.get("chunk_id") or self.id_func(temp_node)
-                node = TextNode(
-                    id_=chunk_id,
-                    text=content,
-                    metadata=meta,
-                    ref_doc_id=doc_id,
+                prompt = CHUNKING_PROMPT.format(
+                    strategy_instruction=self.strategy_instruction,
+                    strategy_id=self.strategy_id,
+                    doc_id=doc_id,
+                    document_text=text,
                 )
-                if start_char_idx is not None and end_char_idx is not None:
-                    node.start_char_idx = start_char_idx
-                    node.end_char_idx = end_char_idx
-                out.append(node)
+                llm = self.llm
+                if llm is None:
+                    from llama_index.core import Settings
+
+                    llm = Settings.llm
+                response = llm.complete(prompt)
+                raw = str(response).strip()
+                try:
+                    chunks = _extract_json_array(raw)
+                except (json.JSONDecodeError, TypeError):
+                    chunks = [
+                        {
+                            "chunk_id": f"{doc_id}_fallback",
+                            "content": text,
+                            "start_char": 0,
+                            "end_char": len(text),
+                            "metadata": {"strategy": self.strategy_id, "source_doc": doc_id},
+                        }
+                    ]
+                doc_len = len(text)
+                for c in chunks:
+                    content = c.get("content", "")
+                    meta = c.get("metadata") or {}
+                    meta.setdefault("strategy", self.strategy_id)
+                    meta.setdefault("source_doc", doc_id)
+                    start_char_idx = c.get("start_char")
+                    end_char_idx = c.get("end_char")
+                    if start_char_idx is not None and end_char_idx is not None:
+                        try:
+                            start_char_idx = int(start_char_idx)
+                            end_char_idx = int(end_char_idx)
+                            if start_char_idx < 0 or end_char_idx > doc_len or start_char_idx >= end_char_idx:
+                                start_char_idx = end_char_idx = None
+                        except (TypeError, ValueError):
+                            start_char_idx = end_char_idx = None
+                    else:
+                        start_char_idx = end_char_idx = None
+                    temp_node = TextNode(text=content)
+                    chunk_id = c.get("chunk_id") or self.id_func(temp_node)
+                    new_node = TextNode(
+                        id_=chunk_id,
+                        text=content,
+                        metadata=meta,
+                        ref_doc_id=doc_id,
+                    )
+                    if start_char_idx is not None and end_char_idx is not None:
+                        new_node.start_char_idx = start_char_idx
+                        new_node.end_char_idx = end_char_idx
+                    out.append(new_node)
+            except Exception as e:
+                print(
+                    f"      [SKIP] Failed for {doc_id!r}: {e}. Using whole doc as one chunk.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                out.append(
+                    TextNode(
+                        id_=f"{doc_id}_error_fallback",
+                        text=text,
+                        metadata={"strategy": self.strategy_id, "source_doc": doc_id},
+                        ref_doc_id=doc_id,
+                    )
+                )
         return out
