@@ -33,6 +33,15 @@ python scripts/run_with_docs.py path/to/your/docs --interactive
 
 Use `docs` for the included sample. With `--query` or `--interactive`, the script shows **retrieval** (embedding cosine similarity, which chunks were picked, timing) and then the **LLM response** (synthesis from those chunks, timing). Options: `--strategy-id`, `--strategy`, `--model`, `--query`, `--interactive`, `--top-k`.
 
+### Strategy layers and union retrieval
+
+- Each **strategy** (built-in splitter or LLM-based) produces its own **layer of chunks**:
+  - Built-in: Sentence/Token splitters (no LLM) → chunks tagged with `metadata["strategy"] = "s_default"` / `"s_token"`, etc.
+  - LLM: custom natural-language strategies → chunks tagged with their `strategy_id`.
+- The index is built over the **union of all layers** (all chunks from all strategies).
+- At query time, retrieval runs over this union, and the retrieval log shows, for each top‑k hit:
+  - The **source document** and the **strategy id** (`strategy=<id>`) that produced that chunk.
+
 ## Quick start (v0.1 — single strategy, from code)
 
 ```python
