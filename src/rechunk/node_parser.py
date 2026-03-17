@@ -102,6 +102,9 @@ class LLMNodeParser(NodeParser):
                 try:
                     chunks = _extract_json_array(raw)
                 except (json.JSONDecodeError, TypeError):
+                    # If the model returned malformed JSON, fall back to a
+                    # single chunk. We may later choose to re-ask the model
+                    # or apply a repair heuristic instead.
                     chunks = [
                         {
                             "chunk_id": f"{doc_id}_fallback",
@@ -142,17 +145,30 @@ class LLMNodeParser(NodeParser):
                         new_node.end_char_idx = end_char_idx
                     out.append(new_node)
             except Exception as e:
+                # If an individual document fails (timeout, API error, etc.),
+                # we currently fall back to a simple character-window split to
+                # avoid losing the doc entirely. This is intentionally ad hoc
+                # and may be replaced later with a more principled policy.
                 print(
-                    f"      [SKIP] Failed for {doc_id!r}: {e}. Using whole doc as one chunk.",
+                    f"      [SKIP] Failed for {doc_id!r}: {e}. Using simple windowed fallback.",
                     file=sys.stderr,
                     flush=True,
                 )
-                out.append(
-                    TextNode(
-                        id_=f"{doc_id}_error_fallback",
-                        text=text,
-                        metadata={"strategy": self.strategy_id, "source_doc": doc_id},
-                        ref_doc_id=doc_id,
+                max_chars = 24000
+                text_str = text if isinstance(text, str) else str(text)
+                start = 0
+                part_idx = 1
+                while start < len(text_str):
+                    chunk_text = text_str[start : start + max_chars]
+                    fallback_id = f"{doc_id}_error_fallback_part{part_idx}"
+                    out.append(
+                        TextNode(
+                            id_=fallback_id,
+                            text=chunk_text,
+                            metadata={"strategy": self.strategy_id, "source_doc": doc_id},
+                            ref_doc_id=doc_id,
+                        )
                     )
-                )
+                    start += max_chars
+                    part_idx += 1
         return out

@@ -22,7 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from llama_index.core import Document, VectorStoreIndex, Settings
-from llama_index.core.schema import MetadataMode, QueryBundle
+from llama_index.core.schema import MetadataMode, QueryBundle, TextNode
 from llama_index.core.node_parser import SentenceSplitter, TokenTextSplitter
 from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.openai import OpenAIEmbedding
@@ -46,8 +46,12 @@ class Strategy:
     model: str | None = None
 
 
-# Strategies file: project root (next to pyproject.toml)
+# Strategies metadata file: project root (next to pyproject.toml)
 STRATEGIES_FILE = Path(__file__).resolve().parent.parent / "rechunk_strategies.json"
+# Chunk cache directory for per-strategy, per-doc LLM outputs. This is a
+# pragmatic first version; we may later move to a more structured storage
+# layout or a vector-store-native persistence strategy.
+STRATEGY_CACHE_DIR = Path(__file__).resolve().parent.parent / "storage" / "strategies"
 
 
 def _strategy_to_dict(s: Strategy) -> dict:
@@ -88,6 +92,88 @@ def save_strategies(path: Path, strategies: list[Strategy]) -> None:
     """Serialize strategy set to JSON."""
     data = [_strategy_to_dict(s) for s in strategies]
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _strategy_cache_path(strategy_id: str) -> Path:
+    return STRATEGY_CACHE_DIR / f"{strategy_id}_chunks.jsonl"
+
+
+def _node_to_dict(node: TextNode) -> dict:
+    if hasattr(node, "get_content"):
+        text = node.get_content(metadata_mode=MetadataMode.NONE)
+    else:
+        text = getattr(node, "text", "")
+    return {
+        "id": getattr(node, "id_", None) or "",
+        "text": text,
+        "metadata": getattr(node, "metadata", None) or {},
+        "ref_doc_id": getattr(node, "ref_doc_id", None),
+        "start_char_idx": getattr(node, "start_char_idx", None),
+        "end_char_idx": getattr(node, "end_char_idx", None),
+    }
+
+
+def _dict_to_node(d: dict) -> TextNode:
+    node = TextNode(
+        id_=d.get("id", ""),
+        text=d.get("text", ""),
+        metadata=d.get("metadata") or {},
+        ref_doc_id=d.get("ref_doc_id"),
+    )
+    start = d.get("start_char_idx")
+    end = d.get("end_char_idx")
+    if start is not None and end is not None:
+        node.start_char_idx = start
+        node.end_char_idx = end
+    return node
+
+
+def _load_llm_chunk_cache(strategy_id: str) -> dict[str, list[TextNode]]:
+    """
+    Load cached chunks for an LLM strategy, keyed by document content_hash.
+
+    Cache format is deliberately simple JSONL for now; we may later migrate to a
+    more structured store or a proper vector-store-backed cache.
+    """
+    path = _strategy_cache_path(strategy_id)
+    if not path.exists():
+        return {}
+    cache: dict[str, list[TextNode]] = {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    h = rec.get("content_hash")
+                    nodes_data = rec.get("nodes") or []
+                    if not h or not isinstance(nodes_data, list):
+                        continue
+                    cache[h] = [_dict_to_node(n) for n in nodes_data]
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return {}
+    return cache
+
+
+def _append_llm_chunk_cache(strategy_id: str, content_hash: str, nodes: list[TextNode]) -> None:
+    """
+    Append per-doc chunk results to the LLM strategy cache.
+
+    This is intentionally append-only and JSONL-based for simplicity; we may
+    later revise it to support compaction or a different storage backend.
+    """
+    STRATEGY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = _strategy_cache_path(strategy_id)
+    rec = {
+        "content_hash": content_hash,
+        "nodes": [_node_to_dict(n) for n in nodes],
+    }
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
 
 
 def _extract_file_content(path: Path) -> tuple[str | None, str]:
@@ -151,6 +237,49 @@ def _extract_file_content(path: Path) -> tuple[str | None, str]:
 def _content_hash(content: str) -> str:
     """SHA-256 hash of document content for deduplication."""
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _split_long_nodes(nodes: list, max_chars: int = 24000) -> list:
+    """
+    Ensure no node content exceeds max_chars by splitting large nodes.
+
+    This is a pragmatic guardrail for embedding models with hard context limits
+    (e.g., 8k tokens). We may later replace this with a more principled,
+    token-aware splitter or embedder-specific policy.
+    """
+    result: list[TextNode] = []
+    for node in nodes:
+        # Prefer get_content when available; otherwise, fall back to .text
+        if hasattr(node, "get_content"):
+            text = node.get_content(metadata_mode=MetadataMode.NONE)
+        else:
+            text = getattr(node, "text", "")
+        if not isinstance(text, str):
+            text = str(text)
+        if len(text) <= max_chars:
+            result.append(node)
+            continue
+
+        # Split oversized node into smaller windows
+        meta = getattr(node, "metadata", None) or {}
+        ref_doc_id = getattr(node, "ref_doc_id", None) or meta.get("source_doc", "")
+        base_id = getattr(node, "id_", None) or ref_doc_id or "node"
+        start = 0
+        part_idx = 1
+        while start < len(text):
+            chunk_text = text[start : start + max_chars]
+            part_id = f"{base_id}_part{part_idx}"
+            result.append(
+                TextNode(
+                    id_=part_id,
+                    text=chunk_text,
+                    metadata=dict(meta),
+                    ref_doc_id=ref_doc_id,
+                )
+            )
+            start += max_chars
+            part_idx += 1
+    return result
 
 
 def load_documents(path: Path) -> list[Document]:
@@ -240,10 +369,30 @@ def build_index_for_strategies(
                 strategy_instruction=s.instruction,
                 llm=llm,
             )
-            nodes = parser.get_nodes_from_documents(docs, show_progress=True)
-            all_nodes.extend(nodes)
-            print(f"    → {len(nodes)} chunks")
-    print(f"\n  Total: {len(all_nodes)} chunks from {len(strategies)} strategy(ies)")
+            cache = _load_llm_chunk_cache(s.id)
+            strat_nodes: list[BaseNode] = []
+            for j, doc in enumerate(docs, 1):
+                content_hash = (doc.metadata or {}).get("content_hash") if hasattr(doc, "metadata") else None
+                if content_hash and content_hash in cache:
+                    # Cache hit: reuse previously computed chunks for this doc/strategy.
+                    strat_nodes.extend(cache[content_hash])
+                    print(f"    [{j}/{n_docs}] cache hit for hash={content_hash} ({doc.id_})")
+                    continue
+                print(f"    [{j}/{n_docs}] LLM chunking {getattr(doc, 'id_', '')} (model={model})")
+                new_nodes = parser.get_nodes_from_documents([doc], show_progress=True)
+                strat_nodes.extend(new_nodes)
+                if content_hash:
+                    _append_llm_chunk_cache(s.id, content_hash, new_nodes)
+            all_nodes.extend(strat_nodes)
+            print(f"    → {len(strat_nodes)} chunks")
+    print(f"\n  Total before max-length enforcement: {len(all_nodes)} chunks from {len(strategies)} strategy(ies)")
+
+    # Enforce a hard maximum text length per chunk before embedding. This is a
+    # defensive measure against embedding API limits (e.g., 8k-token inputs).
+    # We may later revise this to be token-aware or embedder-specific.
+    all_nodes = _split_long_nodes(all_nodes, max_chars=24000)
+    print(f"  Total after max-length enforcement: {len(all_nodes)} chunks")
+
     index = VectorStoreIndex(all_nodes)
     return index, all_nodes
 

@@ -29,8 +29,9 @@ htmlcov/
 .env.local
 *.env
 
-# User docs (never version-control; may contain sensitive or local content)
+# User docs / local storage (never version-control; may contain sensitive or local content)
 docs/
+storage/
 
 # OS
 .DS_Store
