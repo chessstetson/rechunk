@@ -27,6 +27,7 @@ dependencies = [
     "llama-index-embeddings-openai>=0.2.0",
     "PyPDF2",
     "python-docx",
+    "temporalio",
 ]
 
 [project.optional-dependencies]

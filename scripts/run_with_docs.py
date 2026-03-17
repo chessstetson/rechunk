@@ -10,6 +10,7 @@ Usage:
 Requires OPENAI_API_KEY in the environment.
 """
 
+import asyncio
 import argparse
 import hashlib
 import json
@@ -19,18 +20,23 @@ from dataclasses import dataclass
 from pathlib import Path
 
 # Project root on path so "rechunk" resolves when run as script
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from llama_index.core import Document, VectorStoreIndex, Settings
 from llama_index.core.schema import MetadataMode, QueryBundle, TextNode
-from llama_index.core.node_parser import SentenceSplitter, TokenTextSplitter
 from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.openai import OpenAIEmbedding
+from temporalio.client import Client
+from temporalio.common import WorkflowIDConflictPolicy
 
-from rechunk import LLMNodeParser
+from temporal_workflows import StrategyChunkingInput
 
 # Max characters of chunk text to show in retrieval feedback
 CHUNK_PREVIEW_LEN = 280
+TEMPORAL_ADDRESS = "localhost:7233"
+TEMPORAL_TASK_QUEUE = "rechunk-strategy-chunking"
 
 
 @dataclass
@@ -94,6 +100,65 @@ def save_strategies(path: Path, strategies: list[Strategy]) -> None:
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+def _workflow_id_for_strategy(strategy: Strategy, docs_root: Path, doc_ids: list[str]) -> str:
+    """Derive a stable workflow id for a strategy + corpus snapshot."""
+    safe_id = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in strategy.id)
+    payload = json.dumps(
+        {
+            "strategy": _strategy_to_dict(strategy),
+            "docs_root": str(docs_root),
+            "doc_ids": sorted(doc_ids),
+        },
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    return f"rechunk-{safe_id}-{digest}"
+
+
+async def _start_strategy_chunking_workflow(
+    strategy: Strategy,
+    docs_root: Path,
+    doc_ids: list[str],
+) -> str:
+    """Start a Temporal workflow to populate cache for one strategy."""
+    if not doc_ids:
+        raise ValueError("No documents available to chunk")
+
+    client = await Client.connect(TEMPORAL_ADDRESS)
+    workflow_id = _workflow_id_for_strategy(strategy, docs_root, doc_ids)
+    await client.start_workflow(
+        "StrategyChunkingWorkflow",
+        arg=StrategyChunkingInput(
+            strategy_id=strategy.id,
+            kind=strategy.kind,
+            strategy_instruction=strategy.instruction,
+            model=strategy.model,
+            splitter=getattr(strategy, "splitter", None),
+            docs_root=str(docs_root),
+            doc_ids=doc_ids,
+        ),
+        id=workflow_id,
+        task_queue=TEMPORAL_TASK_QUEUE,
+        id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+    )
+    return workflow_id
+
+
+def trigger_strategy_chunking(strategy: Strategy, docs_root: Path, doc_ids: list[str]) -> None:
+    """Kick off background chunking for a strategy, if Temporal is available."""
+    try:
+        workflow_id = asyncio.run(_start_strategy_chunking_workflow(strategy, docs_root, doc_ids))
+        print(
+            f"Started Temporal workflow {workflow_id!r} for strategy {strategy.id!r} "
+            f"({len(doc_ids)} document(s))."
+        )
+    except Exception as e:
+        print(
+            f"[WARN] Could not start Temporal workflow for strategy {strategy.id!r}: {e}",
+            file=sys.stderr,
+        )
+
+
 def _strategy_cache_path(strategy_id: str) -> Path:
     return STRATEGY_CACHE_DIR / f"{strategy_id}_chunks.jsonl"
 
@@ -128,7 +193,7 @@ def _dict_to_node(d: dict) -> TextNode:
     return node
 
 
-def _load_llm_chunk_cache(strategy_id: str) -> dict[str, list[TextNode]]:
+def _load_strategy_chunk_cache(strategy_id: str) -> dict[str, list[TextNode]]:
     """
     Load cached chunks for an LLM strategy, keyed by document content_hash.
 
@@ -159,7 +224,7 @@ def _load_llm_chunk_cache(strategy_id: str) -> dict[str, list[TextNode]]:
     return cache
 
 
-def _append_llm_chunk_cache(strategy_id: str, content_hash: str, nodes: list[TextNode]) -> None:
+def _append_strategy_chunk_cache(strategy_id: str, content_hash: str, nodes: list[TextNode]) -> None:
     """
     Append per-doc chunk results to the LLM strategy cache.
 
@@ -347,44 +412,22 @@ def build_index_for_strategies(
     n_docs = len(docs)
     for idx, s in enumerate(strategies, 1):
         print(f"\n  Strategy {idx}/{len(strategies)}: {s.id} ({s.kind}) — {n_docs} documents")
-        if s.kind == "builtin_splitter":
-            # LlamaIndex defaults: chunk_size=1024, chunk_overlap=20 (tokens)
-            chunk_size, chunk_overlap = 1024, 20
-            if getattr(s, "splitter", "sentence") == "token":
-                parser = TokenTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-            else:
-                parser = SentenceSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-            nodes = parser.get_nodes_from_documents(docs, show_progress=True)
-            for n in nodes:
-                n.metadata = getattr(n, "metadata", None) or {}
-                n.metadata["strategy"] = s.id
-                n.metadata.setdefault("source_doc", getattr(n, "ref_doc_id", ""))
-            all_nodes.extend(nodes)
-            print(f"    → {len(nodes)} chunks")
-        elif s.kind == "llm":
-            model = getattr(s, "model", None) or "gpt-4o-mini"
-            llm = OpenAI(model=model, temperature=0.1)
-            parser = LLMNodeParser(
-                strategy_id=s.id,
-                strategy_instruction=s.instruction,
-                llm=llm,
-            )
-            cache = _load_llm_chunk_cache(s.id)
+        if s.kind in ("builtin_splitter", "llm"):
+            # Cache-only behaviour for all strategies: reuse precomputed chunks
+            # from storage/strategies/{strategy_id}_chunks.jsonl. The CLI never
+            # computes chunks synchronously; background workers are responsible
+            # for populating the cache.
+            cache = _load_strategy_chunk_cache(s.id)
             strat_nodes: list[BaseNode] = []
             for j, doc in enumerate(docs, 1):
                 content_hash = (doc.metadata or {}).get("content_hash") if hasattr(doc, "metadata") else None
                 if content_hash and content_hash in cache:
-                    # Cache hit: reuse previously computed chunks for this doc/strategy.
                     strat_nodes.extend(cache[content_hash])
                     print(f"    [{j}/{n_docs}] cache hit for hash={content_hash} ({doc.id_})")
-                    continue
-                print(f"    [{j}/{n_docs}] LLM chunking {getattr(doc, 'id_', '')} (model={model})")
-                new_nodes = parser.get_nodes_from_documents([doc], show_progress=True)
-                strat_nodes.extend(new_nodes)
-                if content_hash:
-                    _append_llm_chunk_cache(s.id, content_hash, new_nodes)
+                else:
+                    print(f"    [{j}/{n_docs}] no cached chunks for hash={content_hash} ({doc.id_}); skipping in synchronous path")
             all_nodes.extend(strat_nodes)
-            print(f"    → {len(strat_nodes)} chunks")
+            print(f"    → {len(strat_nodes)} cached chunks")
     print(f"\n  Total before max-length enforcement: {len(all_nodes)} chunks from {len(strategies)} strategy(ies)")
 
     # Enforce a hard maximum text length per chunk before embedding. This is a
@@ -400,6 +443,8 @@ def build_index_for_strategies(
 def manage_strategies_interactively(
     strategies: list[Strategy],
     strategies_path: Path,
+    docs_root: Path,
+    doc_ids: list[str],
 ) -> None:
     """Simple CLI to add/remove strategies (built-in splitters or LLM). Saves after each add/delete."""
     while True:
@@ -430,9 +475,11 @@ def manage_strategies_interactively(
                 continue
             model_input = input("Model (default gpt-4o-mini, or e.g. gpt-4o): ").strip()
             model = model_input if model_input else None
-            strategies.append(Strategy(id=sid, kind="llm", instruction=instr, model=model))
+            strategy = Strategy(id=sid, kind="llm", instruction=instr, model=model)
+            strategies.append(strategy)
             save_strategies(strategies_path, strategies)
             print(f"Added LLM strategy {sid!r} (model={model or 'gpt-4o-mini'}). Saved to {strategies_path.name}")
+            trigger_strategy_chunking(strategy, docs_root, doc_ids)
         elif choice == "b":
             which = input("Built-in splitter: [1] SentenceSplitter  [2] TokenTextSplitter  (1 or 2): ").strip()
             if which == "2":
@@ -443,11 +490,11 @@ def manage_strategies_interactively(
                 sid = "s_sentence"
                 splitter = "sentence"
                 instr = "Sentence-based splitting (LlamaIndex default chunk_size=1024, overlap=20)"
-            strategies.append(
-                Strategy(id=sid, kind="builtin_splitter", instruction=instr, splitter=splitter),
-            )
+            strategy = Strategy(id=sid, kind="builtin_splitter", instruction=instr, splitter=splitter)
+            strategies.append(strategy)
             save_strategies(strategies_path, strategies)
             print(f"Added built-in splitter {sid!r} ({splitter}). Saved to {strategies_path.name}")
+            trigger_strategy_chunking(strategy, docs_root, doc_ids)
         elif choice == "d":
             idx_str = input("Enter number of strategy to delete (or blank to cancel): ").strip()
             if not idx_str:
@@ -582,6 +629,8 @@ def main() -> None:
 
     docs = load_documents(args.path)
     print(f"Loaded {len(docs)} document(s) from {args.path}")
+    docs_root = args.path.resolve().parent if args.path.resolve().is_file() else args.path.resolve()
+    doc_ids = [str(getattr(doc, "id_", "")) for doc in docs if getattr(doc, "id_", None)]
 
     # Load saved strategies if present; otherwise default to one built-in splitter.
     strategies = load_strategies(STRATEGIES_FILE)
@@ -595,15 +644,15 @@ def main() -> None:
             ),
         ]
         if args.strategy:
-            strategies.append(
-                Strategy(id=args.strategy_id, kind="llm", instruction=args.strategy),
-            )
+            strategy = Strategy(id=args.strategy_id, kind="llm", instruction=args.strategy)
+            strategies.append(strategy)
+            trigger_strategy_chunking(strategy, docs_root, doc_ids)
     else:
         print(f"Loaded {len(strategies)} strategy(ies) from {STRATEGIES_FILE.name}")
         if args.strategy:
-            strategies.append(
-                Strategy(id=args.strategy_id, kind="llm", instruction=args.strategy),
-            )
+            strategy = Strategy(id=args.strategy_id, kind="llm", instruction=args.strategy)
+            strategies.append(strategy)
+            trigger_strategy_chunking(strategy, docs_root, doc_ids)
 
     index, nodes = build_index_for_strategies(strategies, docs)
     print(f"ReChunk produced {len(nodes)} nodes across {len(strategies)} strategy(ies)")
@@ -632,7 +681,7 @@ def main() -> None:
                 "Was this answer correct? [y]es / [n]o / [i]ncomplete / [s]kip: "
             ).strip().lower()
             if fb in ("n", "i"):
-                manage_strategies_interactively(strategies, STRATEGIES_FILE)
+                manage_strategies_interactively(strategies, STRATEGIES_FILE, docs_root, doc_ids)
                 # Rebuild index after any strategy changes
                 index, nodes = build_index_for_strategies(strategies, docs)
                 print(
