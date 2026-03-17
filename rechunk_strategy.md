@@ -313,8 +313,8 @@ The following design decisions are unresolved and need further discussion:
 
 | Phase | Milestone |
 |-------|-----------|
-| v0.1 | `LLMNodeParser` — LLM-based chunking with a single strategy |
-| v0.2 | Multi-strategy index with layer tagging and union retrieval |
+| v0.1 | `LLMNodeParser` — LLM-based chunking with a single strategy ✅ |
+| v0.2 | Multi-strategy index with layer tagging and union retrieval ✅ |
 | v0.3 | Feedback signal ingestion and Branch A/B diagnosis |
 | v0.4 | Automatic strategy proposal via LLM |
 | v0.5 | Strategy hit tracking and pruning |
