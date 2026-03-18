@@ -3,6 +3,9 @@ LLM-based node parser that chunks documents according to a strategy instruction.
 
 Strategy is parameterized natural language; the LLM performs the chunking.
 Implements ReChunk v0.1 (single-strategy chunking).
+
+Documents that exceed the model's context length are never sent to the LLM;
+they are chunked with a semi-overlapping window fallback (same as after parse errors).
 """
 
 import json
@@ -12,6 +15,14 @@ from typing import Any, List, Optional, Sequence
 from llama_index.core.llms import LLM
 from llama_index.core.node_parser import NodeParser
 from llama_index.core.schema import BaseNode, MetadataMode, TextNode
+
+# Conservative limit so prompt + document stay under typical 16k context (~4 chars/token).
+# Override via LLMNodeParser(max_doc_chars_for_llm=...) if using a larger context model.
+DEFAULT_MAX_DOC_CHARS_FOR_LLM = 50_000
+
+# Window size and overlap for fallback chunking (used when doc is too long or LLM fails).
+FALLBACK_WINDOW_CHARS = 24_000
+FALLBACK_OVERLAP_CHARS = 4_000
 
 
 CHUNKING_PROMPT = """You are a document chunking engine. Given the document below, apply the following
@@ -51,17 +62,61 @@ def _extract_json_array(text: str) -> List[dict]:
     return json.loads(text)
 
 
+def _windowed_fallback(
+    text: str,
+    doc_id: str,
+    strategy_id: str,
+    *,
+    max_chars: int = FALLBACK_WINDOW_CHARS,
+    overlap_chars: int = FALLBACK_OVERLAP_CHARS,
+    id_prefix: str = "window_fallback",
+) -> List[TextNode]:
+    """
+    Chunk long text into semi-overlapping windows. Used when the doc exceeds
+    model context length (pre-check) or when the LLM call fails (post-error).
+    """
+    text_str = text if isinstance(text, str) else str(text)
+    if not text_str.strip():
+        return []
+    step = max(1, max_chars - overlap_chars)
+    out: List[TextNode] = []
+    start = 0
+    part_idx = 1
+    while start < len(text_str):
+        end = min(start + max_chars, len(text_str))
+        chunk_text = text_str[start:end]
+        fallback_id = f"{doc_id}_{id_prefix}_part{part_idx}"
+        node = TextNode(
+            id_=fallback_id,
+            text=chunk_text,
+            metadata={"strategy": strategy_id, "source_doc": doc_id},
+            ref_doc_id=doc_id,
+        )
+        node.start_char_idx = start
+        node.end_char_idx = end
+        out.append(node)
+        if end >= len(text_str):
+            break
+        start += step
+        part_idx += 1
+    return out
+
+
 class LLMNodeParser(NodeParser):
     """
     Node parser that uses an LLM to chunk documents according to a strategy instruction.
 
     Each chunk is tagged with strategy_id and source_doc in metadata so that
     multi-strategy layers can be attributed (v0.2+).
+
+    Documents longer than max_doc_chars_for_llm are never sent to the LLM; they
+    are chunked with semi-overlapping windows (same as the post-error fallback).
     """
 
     strategy_id: str
     strategy_instruction: str
     llm: Optional[LLM] = None
+    max_doc_chars_for_llm: int = DEFAULT_MAX_DOC_CHARS_FOR_LLM
 
     def _parse_nodes(
         self,
@@ -84,6 +139,25 @@ class LLMNodeParser(NodeParser):
             else:
                 text = node.get_content(metadata_mode=MetadataMode.NONE)
             if not text.strip():
+                continue
+            # Pre-check: if doc exceeds model context length, use windowed fallback
+            # instead of calling the LLM (avoids a guaranteed failure and retries).
+            if len(text) > self.max_doc_chars_for_llm:
+                import sys
+
+                print(
+                    f"      [SKIP] Doc over {self.max_doc_chars_for_llm} chars ({doc_id!r}). Using semi-overlapping window fallback.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                out.extend(
+                    _windowed_fallback(
+                        text,
+                        doc_id,
+                        self.strategy_id,
+                        id_prefix="length_fallback",
+                    )
+                )
                 continue
             try:
                 prompt = CHUNKING_PROMPT.format(
@@ -145,30 +219,19 @@ class LLMNodeParser(NodeParser):
                         new_node.end_char_idx = end_char_idx
                     out.append(new_node)
             except Exception as e:
-                # If an individual document fails (timeout, API error, etc.),
-                # we currently fall back to a simple character-window split to
-                # avoid losing the doc entirely. This is intentionally ad hoc
-                # and may be replaced later with a more principled policy.
+                # If an individual document fails (timeout, API error, context_length_exceeded, etc.),
+                # fall back to semi-overlapping windows so we don't lose the doc.
                 print(
-                    f"      [SKIP] Failed for {doc_id!r}: {e}. Using simple windowed fallback.",
+                    f"      [SKIP] Failed for {doc_id!r}: {e}. Using semi-overlapping window fallback.",
                     file=sys.stderr,
                     flush=True,
                 )
-                max_chars = 24000
-                text_str = text if isinstance(text, str) else str(text)
-                start = 0
-                part_idx = 1
-                while start < len(text_str):
-                    chunk_text = text_str[start : start + max_chars]
-                    fallback_id = f"{doc_id}_error_fallback_part{part_idx}"
-                    out.append(
-                        TextNode(
-                            id_=fallback_id,
-                            text=chunk_text,
-                            metadata={"strategy": self.strategy_id, "source_doc": doc_id},
-                            ref_doc_id=doc_id,
-                        )
+                out.extend(
+                    _windowed_fallback(
+                        text,
+                        doc_id,
+                        self.strategy_id,
+                        id_prefix="error_fallback",
                     )
-                    start += max_chars
-                    part_idx += 1
+                )
         return out

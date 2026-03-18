@@ -1,10 +1,13 @@
 """
 Step 0.1 & 0.2: Verify activity logic, cache round-trip, and activity run inside Temporal.
+Step 1.5: Verify activity retries (one doc fails once, retry succeeds; other docs complete).
 
 0.1: Code path and cache work without Temporal. 0.2: Real activity runs in Temporal's
-ActivityEnvironment and writes to cache. No Temporal server or real LLM.
+ActivityEnvironment and writes to cache. 1.5: Workflow + worker; one activity fails
+on first attempt, Temporal retries it; both docs end up in cache.
 """
 
+import asyncio
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -268,5 +271,113 @@ async def test_real_llm_chunking_in_activity(tmp_path):
             assert node.metadata.get("source_doc") == doc_id
         all_text = " ".join(n.text for n in got)
         assert "founded in 2020" in all_text or "developer tools" in all_text or "chunking" in all_text
+    finally:
+        os.environ.pop("RECHUNK_STRATEGY_CACHE_DIR", None)
+
+
+# --- Step 1.5: Verify retries (workflow + worker; one activity fails once, retry succeeds) ---
+
+TASK_QUEUE_RETRY = "rechunk-strategy-chunking"
+
+
+@pytest.mark.asyncio
+async def test_activity_retry_one_doc_fails_then_succeeds(tmp_path):
+    """
+    Step 1.5: Run full workflow with 2 docs; second doc's activity fails on first attempt
+    (simulated rate-limit). Temporal retries; on retry the activity succeeds. Assert both
+    docs end up in cache. Uses WorkflowEnvironment (may download Temporal test server).
+    """
+    os.environ["RECHUNK_STRATEGY_CACHE_DIR"] = str(tmp_path)
+    try:
+        # Two docs so we can assert both complete (one after retry).
+        (tmp_path / "ok.txt").write_text("Doc A content.", encoding="utf-8")
+        (tmp_path / "fail_once.txt").write_text("Doc B content.", encoding="utf-8")
+        hash_a = compute_content_hash("Doc A content.")
+        hash_b = compute_content_hash("Doc B content.")
+
+        from temporalio import activity
+        from temporalio.exceptions import ApplicationError
+        from temporalio.worker import Worker
+        from temporalio.testing import WorkflowEnvironment
+
+        from temporal_activities import chunk_doc_with_strategy as real_chunk_doc_with_strategy
+        from temporal_activities import ChunkDocInput
+        from temporal_workflows import StrategyChunkingWorkflow, StrategyChunkingInput
+
+        # Wrapper: fail on first attempt only for fail_once.txt (simulated rate-limit).
+        @activity.defn(name="chunk_doc_with_strategy")
+        async def chunk_doc_fail_once_then_ok(input: ChunkDocInput):
+            info = activity.info()
+            if input.doc_id == "fail_once.txt" and info.attempt == 1:
+                raise ApplicationError(
+                    "Simulated rate limit for retry test",
+                    non_retryable=False,
+                )
+            return await real_chunk_doc_with_strategy(input)
+
+        # Mock LLM so real activity does not call OpenAI.
+        mock_nodes_a = [
+            TextNode(text="Doc A chunk", metadata={"strategy": "test_retry", "source_doc": "ok.txt"}),
+        ]
+        mock_nodes_b = [
+            TextNode(text="Doc B chunk", metadata={"strategy": "test_retry", "source_doc": "fail_once.txt"}),
+        ]
+
+        def mock_get_nodes(docs):
+            if not docs:
+                return []
+            # Identify doc by content (activity runs one doc at a time).
+            if docs[0].text.strip() == "Doc A content.":
+                return mock_nodes_a
+            return mock_nodes_b
+
+        with patch(
+            "rechunk.node_parser.LLMNodeParser.get_nodes_from_documents",
+            side_effect=mock_get_nodes,
+        ):
+            try:
+                env = await WorkflowEnvironment.start_time_skipping()
+            except RuntimeError as e:
+                if "test server" in str(e).lower() or "Failed starting" in str(e):
+                    pytest.skip(
+                        "Temporal test server unavailable (e.g. no network). "
+                        "Run with network to verify retries."
+                    )
+                raise
+            async with env:
+                worker = Worker(
+                    env.client,
+                    task_queue=TASK_QUEUE_RETRY,
+                    workflows=[StrategyChunkingWorkflow],
+                    activities=[chunk_doc_fail_once_then_ok],
+                )
+                worker_task = asyncio.create_task(worker.run())
+                try:
+                    workflow_input = StrategyChunkingInput(
+                        strategy_id="test_retry",
+                        strategy_instruction="Split.",
+                        model=None,
+                        docs_root=str(tmp_path),
+                        doc_ids=["ok.txt", "fail_once.txt"],
+                    )
+                    handle = await env.client.start_workflow(
+                        StrategyChunkingWorkflow.run,
+                        workflow_input,
+                        id="test-retry-1",
+                        task_queue=TASK_QUEUE_RETRY,
+                    )
+                    await handle.result()
+                    # Both docs should be in cache (second after retry).
+                    loaded = load_chunk_cache("test_retry")
+                    assert hash_a in loaded, "First doc should be in cache"
+                    assert hash_b in loaded, "Second doc should be in cache after retry"
+                    assert len(loaded[hash_a]) >= 1
+                    assert len(loaded[hash_b]) >= 1
+                finally:
+                    worker_task.cancel()
+                    try:
+                        await worker_task
+                    except asyncio.CancelledError:
+                        pass
     finally:
         os.environ.pop("RECHUNK_STRATEGY_CACHE_DIR", None)
