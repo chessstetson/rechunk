@@ -1,19 +1,5 @@
 [
   {
-    "id": "s_default",
-    "kind": "builtin_splitter",
-    "instruction": "Sentence-based splitting (LlamaIndex default, chunk_size=1024)",
-    "splitter": "sentence",
-    "model": null
-  },
-  {
-    "id": "s_token",
-    "kind": "builtin_splitter",
-    "instruction": "Token-based splitting (LlamaIndex default chunk_size=1024, overlap=20)",
-    "splitter": "token",
-    "model": null
-  },
-  {
     "id": "procedures_hone_in",
     "kind": "llm",
     "instruction": "procedures",
