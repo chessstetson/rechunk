@@ -19,5 +19,12 @@
     "instruction": "procedures",
     "splitter": "sentence",
     "model": null
+  },
+  {
+    "id": "medical_procedures",
+    "kind": "llm",
+    "instruction": "specific medical procedures only",
+    "splitter": "sentence",
+    "model": null
   }
 ]

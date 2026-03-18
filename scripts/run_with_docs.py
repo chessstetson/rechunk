@@ -128,9 +128,9 @@ def _dict_to_node(d: dict) -> TextNode:
     return node
 
 
-def _load_llm_chunk_cache(strategy_id: str) -> dict[str, list[TextNode]]:
+def _load_strategy_chunk_cache(strategy_id: str) -> dict[str, list[TextNode]]:
     """
-    Load cached chunks for an LLM strategy, keyed by document content_hash.
+    Load cached chunks for a strategy, keyed by document content_hash.
 
     Cache format is deliberately simple JSONL for now; we may later migrate to a
     more structured store or a proper vector-store-backed cache.
@@ -159,9 +159,9 @@ def _load_llm_chunk_cache(strategy_id: str) -> dict[str, list[TextNode]]:
     return cache
 
 
-def _append_llm_chunk_cache(strategy_id: str, content_hash: str, nodes: list[TextNode]) -> None:
+def _append_strategy_chunk_cache(strategy_id: str, content_hash: str, nodes: list[TextNode]) -> None:
     """
-    Append per-doc chunk results to the LLM strategy cache.
+    Append per-doc chunk results to the per-strategy JSONL cache.
 
     This is intentionally append-only and JSONL-based for simplicity; we may
     later revise it to support compaction or a different storage backend.
@@ -348,19 +348,36 @@ def build_index_for_strategies(
     for idx, s in enumerate(strategies, 1):
         print(f"\n  Strategy {idx}/{len(strategies)}: {s.id} ({s.kind}) — {n_docs} documents")
         if s.kind == "builtin_splitter":
+            cache = _load_strategy_chunk_cache(s.id)
+            strat_nodes: list[BaseNode] = []
+
             # LlamaIndex defaults: chunk_size=1024, chunk_overlap=20 (tokens)
             chunk_size, chunk_overlap = 1024, 20
             if getattr(s, "splitter", "sentence") == "token":
                 parser = TokenTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
             else:
                 parser = SentenceSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-            nodes = parser.get_nodes_from_documents(docs, show_progress=True)
-            for n in nodes:
-                n.metadata = getattr(n, "metadata", None) or {}
-                n.metadata["strategy"] = s.id
-                n.metadata.setdefault("source_doc", getattr(n, "ref_doc_id", ""))
-            all_nodes.extend(nodes)
-            print(f"    → {len(nodes)} chunks")
+
+            for j, doc in enumerate(docs, 1):
+                content_hash = (doc.metadata or {}).get("content_hash") if hasattr(doc, "metadata") else None
+                if content_hash and content_hash in cache:
+                    strat_nodes.extend(cache[content_hash])
+                    print(f"    [{j}/{n_docs}] cache hit for hash={content_hash} ({doc.id_})")
+                    continue
+
+                # Cache miss: compute chunks for this doc and immediately persist them.
+                print(f"    [{j}/{n_docs}] builtin chunking {doc.id_} (splitter={getattr(s, 'splitter', 'sentence')})")
+                new_nodes = parser.get_nodes_from_documents([doc], show_progress=False)
+                for n in new_nodes:
+                    n.metadata = getattr(n, "metadata", None) or {}
+                    n.metadata["strategy"] = s.id
+                    n.metadata.setdefault("source_doc", getattr(n, "ref_doc_id", ""))
+                strat_nodes.extend(new_nodes)
+                if content_hash:
+                    _append_strategy_chunk_cache(s.id, content_hash, new_nodes)
+
+            all_nodes.extend(strat_nodes)
+            print(f"    → {len(strat_nodes)} chunks")
         elif s.kind == "llm":
             model = getattr(s, "model", None) or "gpt-4o-mini"
             llm = OpenAI(model=model, temperature=0.1)
@@ -369,7 +386,7 @@ def build_index_for_strategies(
                 strategy_instruction=s.instruction,
                 llm=llm,
             )
-            cache = _load_llm_chunk_cache(s.id)
+            cache = _load_strategy_chunk_cache(s.id)
             strat_nodes: list[BaseNode] = []
             for j, doc in enumerate(docs, 1):
                 content_hash = (doc.metadata or {}).get("content_hash") if hasattr(doc, "metadata") else None
@@ -382,7 +399,7 @@ def build_index_for_strategies(
                 new_nodes = parser.get_nodes_from_documents([doc], show_progress=True)
                 strat_nodes.extend(new_nodes)
                 if content_hash:
-                    _append_llm_chunk_cache(s.id, content_hash, new_nodes)
+                    _append_strategy_chunk_cache(s.id, content_hash, new_nodes)
             all_nodes.extend(strat_nodes)
             print(f"    → {len(strat_nodes)} chunks")
     print(f"\n  Total before max-length enforcement: {len(all_nodes)} chunks from {len(strategies)} strategy(ies)")
