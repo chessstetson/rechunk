@@ -136,7 +136,7 @@ This document breaks down the **ReChunk × Temporal development plan** (e.g. `re
 
 - [x] **3.2.1** `StrategyChunkingInput` has `kind` and `splitter`; workflow calls `chunk_doc_with_strategy` or `chunk_doc_with_builtin_splitter`. **Done.**
 - [x] **3.2.2** `start_strategy_chunking.py` accepts `--kind llm|builtin` and `--splitter sentence|token`. **Done.**
-- [x] **3.2.3** Adding a strategy in the interactive menu triggers the workflow (`_trigger_strategy_chunking_sync`). **Done.**
+- [x] **3.2.3** Adding a strategy in the interactive menu triggers the workflow (`rechunk.temporal_client.trigger_strategy_chunking_sync`). **Done.**
 
 **Phase 3 done when:** CLI only reads cache; all chunking is done by the worker. Rebuild index after worker backfills to see new chunks.
 
