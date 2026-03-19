@@ -1,9 +1,15 @@
 """
 Shared strategy chunk cache for ReChunk.
 
-Used by the CLI and (later) Temporal activities so both read/write the same
+Used by the CLI and Temporal activities so both read/write the same
 storage/strategies/{strategy_id}_chunks.jsonl format. Storage directory can be
 overridden via env RECHUNK_STRATEGY_CACHE_DIR for tests.
+
+Freshness: the cache exposes whether it has been updated since a previous
+snapshot. Today this is implemented by comparing file mtimes; in principle a
+background process (e.g. a Temporal worker or another thread) could set an
+"I've been updated" flag and the cache could report that instead, so the CLI
+never touches the filesystem directly.
 """
 
 import hashlib
@@ -78,6 +84,33 @@ def append_chunk_cache(strategy_id: str, content_hash: str, nodes: List[TextNode
         f.write(json.dumps(rec) + "\n")
 
 
+def get_cached_hashes_for_strategy(strategy_id: str) -> List[str]:
+    """
+    Return all content_hash values present in the strategy's cache file.
+    Used by the workflow to skip docs that are already chunked (Phase 2).
+    """
+    path = _strategy_cache_path(strategy_id)
+    if not path.exists():
+        return []
+    hashes_set: set[str] = set()
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    h = rec.get("content_hash")
+                    if h and isinstance(h, str):
+                        hashes_set.add(h)
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        pass
+    return sorted(hashes_set)
+
+
 def load_chunk_cache(strategy_id: str) -> Dict[str, List[TextNode]]:
     """
     Load cached chunks for a strategy, keyed by document content_hash.
@@ -105,3 +138,34 @@ def load_chunk_cache(strategy_id: str) -> Dict[str, List[TextNode]]:
     except OSError:
         return {}
     return cache
+
+
+# --- Freshness: has the cache been updated? (CLI asks cache; cache does the checking) ---
+
+
+def get_strategy_cache_mtimes(strategy_ids: List[str]) -> Dict[str, float]:
+    """
+    Return current mtime (or 0.0 if missing) for each strategy's cache file.
+    Caller can store this and later ask cache_updated_since() if anything changed.
+    """
+    out: Dict[str, float] = {}
+    for sid in strategy_ids:
+        path = _strategy_cache_path(sid)
+        out[sid] = path.stat().st_mtime if path.exists() else 0.0
+    return out
+
+
+def cache_updated_since(strategy_ids: List[str], last_known: Dict[str, float]) -> bool:
+    """
+    True if any of the given strategies' cache files have been modified since
+    the last_known mtimes (e.g. from get_strategy_cache_mtimes).
+    The cache does the filesystem check; the CLI just asks. In the future,
+    a background process could set an "updated" flag and we could check that
+    instead so the CLI never touches the filesystem.
+    """
+    for sid in strategy_ids:
+        path = _strategy_cache_path(sid)
+        current = path.stat().st_mtime if path.exists() else 0.0
+        if current > last_known.get(sid, 0.0):
+            return True
+    return False

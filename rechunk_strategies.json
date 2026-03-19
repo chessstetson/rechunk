@@ -1,15 +1,8 @@
 [
   {
-    "id": "procedures_hone_in",
+    "id": "s_admin_protocols",
     "kind": "llm",
-    "instruction": "procedures",
-    "splitter": "sentence",
-    "model": null
-  },
-  {
-    "id": "medical_procedures",
-    "kind": "llm",
-    "instruction": "specific medical procedures only",
+    "instruction": "\"Find all instances of admin protocols; each instance is a separate chunk\"",
     "splitter": "sentence",
     "model": null
   }

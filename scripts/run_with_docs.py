@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """
-Run ReChunk on a set of documents: load docs, chunk with an LLM strategy, build index, query.
+Run ReChunk on a set of documents: build index from cache, then query.
+
+Chunking is done by the Temporal worker only. Run the worker and scripts/start_strategy_chunking.py
+to backfill chunks for each strategy; this script only reads from storage/strategies/ and never runs
+chunking (LLM or built-in) itself.
 
 Usage:
-  python scripts/run_with_docs.py <path>                    # chunk + index, then remind to use --query
-  python scripts/run_with_docs.py <path> --query "?"        # one query with retrieval + LLM feedback
-  python scripts/run_with_docs.py <path> --interactive       # chunk + index once, then prompt for questions
+  python scripts/run_with_docs.py <path>                    # index from cache, then remind to use --query
+  python scripts/run_with_docs.py <path> --query "?"         # one query with retrieval + LLM feedback
+  python scripts/run_with_docs.py <path> --interactive        # index from cache, then prompt for questions
 
-Requires OPENAI_API_KEY in the environment.
+Requires OPENAI_API_KEY for LLM synthesis at query time.
 """
 
 import argparse
+import asyncio
 import hashlib
 import json
 import sys
@@ -18,16 +23,18 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-# Project root on path so "rechunk" resolves when run as script
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+# Project root and src on path (rechunk + temporal_workflows)
+_script_dir = Path(__file__).resolve().parent
+_project_root = _script_dir.parent
+sys.path.insert(0, str(_project_root / "src"))
+sys.path.insert(0, str(_project_root))
 
 from llama_index.core import Document, VectorStoreIndex, Settings
 from llama_index.core.schema import MetadataMode, QueryBundle, TextNode
-from llama_index.core.node_parser import SentenceSplitter, TokenTextSplitter
 from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.openai import OpenAIEmbedding
 
-from rechunk import LLMNodeParser
+from rechunk.cache import cache_updated_since, get_strategy_cache_mtimes
 
 # Max characters of chunk text to show in retrieval feedback
 CHUNK_PREVIEW_LEN = 280
@@ -52,6 +59,14 @@ STRATEGIES_FILE = Path(__file__).resolve().parent.parent / "rechunk_strategies.j
 # pragmatic first version; we may later move to a more structured storage
 # layout or a vector-store-native persistence strategy.
 STRATEGY_CACHE_DIR = Path(__file__).resolve().parent.parent / "storage" / "strategies"
+
+# Default when no strategy file exists: baseline (built-in) only, never LLM.
+DEFAULT_BASELINE_STRATEGY = Strategy(
+    id="s_default",
+    kind="builtin_splitter",
+    instruction="Sentence-based splitting (LlamaIndex default, chunk_size=1024)",
+    splitter="sentence",
+)
 
 
 def _strategy_to_dict(s: Strategy) -> dict:
@@ -239,14 +254,33 @@ def _content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def _split_long_nodes(nodes: list, max_chars: int = 24000) -> list:
+def _split_long_nodes(
+    nodes: list,
+    *,
+    # OpenAI embedding endpoint hard-limit is 8192 tokens for some models; use a safety margin.
+    max_embed_tokens: int = 7500,
+    overlap_tokens: int = 200,
+    max_chars_fallback: int = 12000,
+) -> list:
     """
-    Ensure no node content exceeds max_chars by splitting large nodes.
+    Ensure no node content exceeds embedding limits by splitting large nodes.
 
     This is a pragmatic guardrail for embedding models with hard context limits
     (e.g., 8k tokens). We may later replace this with a more principled,
     token-aware splitter or embedder-specific policy.
     """
+    # Token-aware splitting using tiktoken (matches OpenAI tokenization more closely than char counts).
+    enc = None
+    try:
+        import tiktoken  # type: ignore
+
+        try:
+            enc = tiktoken.encoding_for_model("text-embedding-3-small")
+        except Exception:
+            enc = tiktoken.get_encoding("cl100k_base")
+    except Exception:
+        enc = None
+
     result: list[TextNode] = []
     for node in nodes:
         # Prefer get_content when available; otherwise, fall back to .text
@@ -256,28 +290,49 @@ def _split_long_nodes(nodes: list, max_chars: int = 24000) -> list:
             text = getattr(node, "text", "")
         if not isinstance(text, str):
             text = str(text)
-        if len(text) <= max_chars:
+
+        # Fast path: token count under limit (or char fallback under limit).
+        token_count = None
+        if enc is not None:
+            try:
+                token_count = len(enc.encode(text))
+            except Exception:
+                token_count = None
+        if (token_count is not None and token_count <= max_embed_tokens) or (
+            token_count is None and len(text) <= max_chars_fallback
+        ):
             result.append(node)
             continue
 
-        # Split oversized node into smaller windows
+        # Split oversized node into smaller windows.
         meta = getattr(node, "metadata", None) or {}
         ref_doc_id = getattr(node, "ref_doc_id", None) or meta.get("source_doc", "")
         base_id = getattr(node, "id_", None) or ref_doc_id or "node"
-        start = 0
         part_idx = 1
+        if enc is not None:
+            try:
+                toks = enc.encode(text)
+                step = max(1, max_embed_tokens - max(0, overlap_tokens))
+                start = 0
+                while start < len(toks):
+                    window = toks[start : start + max_embed_tokens]
+                    chunk_text = enc.decode(window)
+                    part_id = f"{base_id}_part{part_idx}"
+                    result.append(TextNode(id_=part_id, text=chunk_text, metadata=dict(meta), ref_doc_id=ref_doc_id))
+                    part_idx += 1
+                    start += step
+                continue
+            except Exception:
+                # Fall back to char splitting below.
+                pass
+
+        # Char-based fallback split (best-effort).
+        start = 0
         while start < len(text):
-            chunk_text = text[start : start + max_chars]
+            chunk_text = text[start : start + max_chars_fallback]
             part_id = f"{base_id}_part{part_idx}"
-            result.append(
-                TextNode(
-                    id_=part_id,
-                    text=chunk_text,
-                    metadata=dict(meta),
-                    ref_doc_id=ref_doc_id,
-                )
-            )
-            start += max_chars
+            result.append(TextNode(id_=part_id, text=chunk_text, metadata=dict(meta), ref_doc_id=ref_doc_id))
+            start += max_chars_fallback
             part_idx += 1
     return result
 
@@ -339,86 +394,99 @@ def load_documents(path: Path) -> list[Document]:
 def build_index_for_strategies(
     strategies: list[Strategy],
     docs: list[Document],
+    *,
+    quiet: bool = False,
 ) -> tuple[VectorStoreIndex, list]:
-    """Run all active strategies over docs and build a combined index."""
+    """Build index from cache only. All chunking is done by the Temporal worker; CLI never runs chunking."""
     from llama_index.core.schema import BaseNode
 
     all_nodes: list[BaseNode] = []
     n_docs = len(docs)
     for idx, s in enumerate(strategies, 1):
-        print(f"\n  Strategy {idx}/{len(strategies)}: {s.id} ({s.kind}) — {n_docs} documents")
-        if s.kind == "builtin_splitter":
-            cache = _load_strategy_chunk_cache(s.id)
-            strat_nodes: list[BaseNode] = []
-
-            # LlamaIndex defaults: chunk_size=1024, chunk_overlap=20 (tokens)
-            chunk_size, chunk_overlap = 1024, 20
-            if getattr(s, "splitter", "sentence") == "token":
-                parser = TokenTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        if not quiet:
+            print(f"\n  Strategy {idx}/{len(strategies)}: {s.id} ({s.kind}) — {n_docs} documents")
+        cache = _load_strategy_chunk_cache(s.id)
+        strat_nodes: list[BaseNode] = []
+        for j, doc in enumerate(docs, 1):
+            content_hash = (doc.metadata or {}).get("content_hash") if hasattr(doc, "metadata") else None
+            if content_hash and content_hash in cache:
+                strat_nodes.extend(cache[content_hash])
+                if not quiet:
+                    print(f"    [{j}/{n_docs}] cache hit for hash={content_hash[:12]}... ({doc.id_})")
             else:
-                parser = SentenceSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-
-            for j, doc in enumerate(docs, 1):
-                content_hash = (doc.metadata or {}).get("content_hash") if hasattr(doc, "metadata") else None
-                if content_hash and content_hash in cache:
-                    strat_nodes.extend(cache[content_hash])
-                    print(f"    [{j}/{n_docs}] cache hit for hash={content_hash} ({doc.id_})")
-                    continue
-
-                # Cache miss: compute chunks for this doc and immediately persist them.
-                print(f"    [{j}/{n_docs}] builtin chunking {doc.id_} (splitter={getattr(s, 'splitter', 'sentence')})")
-                new_nodes = parser.get_nodes_from_documents([doc], show_progress=False)
-                for n in new_nodes:
-                    n.metadata = getattr(n, "metadata", None) or {}
-                    n.metadata["strategy"] = s.id
-                    n.metadata.setdefault("source_doc", getattr(n, "ref_doc_id", ""))
-                strat_nodes.extend(new_nodes)
-                if content_hash:
-                    _append_strategy_chunk_cache(s.id, content_hash, new_nodes)
-
-            all_nodes.extend(strat_nodes)
-            print(f"    → {len(strat_nodes)} chunks")
-        elif s.kind == "llm":
-            model = getattr(s, "model", None) or "gpt-4o-mini"
-            llm = OpenAI(model=model, temperature=0.1)
-            parser = LLMNodeParser(
-                strategy_id=s.id,
-                strategy_instruction=s.instruction,
-                llm=llm,
-            )
-            cache = _load_strategy_chunk_cache(s.id)
-            strat_nodes: list[BaseNode] = []
-            for j, doc in enumerate(docs, 1):
-                content_hash = (doc.metadata or {}).get("content_hash") if hasattr(doc, "metadata") else None
-                if content_hash and content_hash in cache:
-                    # Cache hit: reuse previously computed chunks for this doc/strategy.
-                    strat_nodes.extend(cache[content_hash])
-                    print(f"    [{j}/{n_docs}] cache hit for hash={content_hash} ({doc.id_})")
-                    continue
-                print(f"    [{j}/{n_docs}] LLM chunking {getattr(doc, 'id_', '')} (model={model})")
-                new_nodes = parser.get_nodes_from_documents([doc], show_progress=True)
-                strat_nodes.extend(new_nodes)
-                if content_hash:
-                    _append_strategy_chunk_cache(s.id, content_hash, new_nodes)
-            all_nodes.extend(strat_nodes)
-            print(f"    → {len(strat_nodes)} chunks")
-    print(f"\n  Total before max-length enforcement: {len(all_nodes)} chunks from {len(strategies)} strategy(ies)")
+                if not quiet:
+                    print(
+                        f"    [{j}/{n_docs}] no cached chunks for {getattr(doc, 'id_', '?')!r} (strategy {s.id}); "
+                        "run worker + start_strategy_chunking to backfill."
+                    )
+        all_nodes.extend(strat_nodes)
+        if not quiet:
+            print(f"    → {len(strat_nodes)} chunks from cache")
+    if not quiet:
+        print(f"\n  Total before max-length enforcement: {len(all_nodes)} chunks from {len(strategies)} strategy(ies)")
 
     # Enforce a hard maximum text length per chunk before embedding. This is a
     # defensive measure against embedding API limits (e.g., 8k-token inputs).
     # We may later revise this to be token-aware or embedder-specific.
-    all_nodes = _split_long_nodes(all_nodes, max_chars=24000)
-    print(f"  Total after max-length enforcement: {len(all_nodes)} chunks")
+    all_nodes = _split_long_nodes(all_nodes)
+    if not quiet:
+        print(f"  Total after max-length enforcement: {len(all_nodes)} chunks")
 
-    index = VectorStoreIndex(all_nodes)
+    try:
+        index = VectorStoreIndex(all_nodes)
+    except Exception as e:
+        # Embedding calls can still fail (rate limits, token limits, network). Provide a clearer message.
+        raise RuntimeError(
+            "Failed to build VectorStoreIndex (embedding step). "
+            "This usually means one chunk exceeded the embed token limit or the embedding API failed. "
+            "Try rerunning, or reduce chunk sizes."
+        ) from e
     return index, all_nodes
+
+
+def _trigger_strategy_chunking_sync(docs_root: Path, doc_ids: list[str], strategy: Strategy) -> None:
+    """Start Temporal workflow for this strategy (so worker backfills chunks). Runs async client in sync context."""
+    try:
+        from temporalio.client import Client
+        from temporal_workflows import StrategyChunkingInput, StrategyChunkingWorkflow
+    except ImportError:
+        print("  (Temporal not available; run scripts/start_strategy_chunking.py manually to backfill.)", file=sys.stderr)
+        return
+    TASK_QUEUE = "rechunk-strategy-chunking"
+
+    async def _run() -> None:
+        client = await Client.connect("localhost:7233")
+        workflow_id = f"rechunk-{strategy.id}"
+        await client.start_workflow(
+            StrategyChunkingWorkflow,
+            StrategyChunkingInput(
+                strategy_id=strategy.id,
+                kind=strategy.kind,
+                docs_root=str(docs_root.resolve()),
+                doc_ids=doc_ids,
+                strategy_instruction=strategy.instruction if strategy.kind == "llm" else None,
+                model=getattr(strategy, "model", None),
+                splitter=getattr(strategy, "splitter", "sentence"),
+            ),
+            id=workflow_id,
+            task_queue=TASK_QUEUE,
+        )
+        print(f"  Started workflow {workflow_id}. Worker will backfill chunks for strategy {strategy.id!r}.", file=sys.stderr)
+
+    try:
+        asyncio.run(_run())
+    except Exception as e:
+        print(f"  Could not start workflow: {e}. Run scripts/start_strategy_chunking.py manually if needed.", file=sys.stderr)
 
 
 def manage_strategies_interactively(
     strategies: list[Strategy],
     strategies_path: Path,
+    docs_root: Path | None = None,
+    doc_ids: list[str] | None = None,
 ) -> None:
-    """Simple CLI to add/remove strategies (built-in splitters or LLM). Saves after each add/delete."""
+    """Simple CLI to add/remove strategies (built-in splitters or LLM). Saves after each add/delete.
+    If docs_root and doc_ids are provided, starting a new strategy also triggers the Temporal workflow."""
     while True:
         print("\nCurrent strategies:")
         for i, s in enumerate(strategies, 1):
@@ -450,6 +518,8 @@ def manage_strategies_interactively(
             strategies.append(Strategy(id=sid, kind="llm", instruction=instr, model=model))
             save_strategies(strategies_path, strategies)
             print(f"Added LLM strategy {sid!r} (model={model or 'gpt-4o-mini'}). Saved to {strategies_path.name}")
+            if docs_root is not None and doc_ids:
+                _trigger_strategy_chunking_sync(docs_root, doc_ids, strategies[-1])
         elif choice == "b":
             which = input("Built-in splitter: [1] SentenceSplitter  [2] TokenTextSplitter  (1 or 2): ").strip()
             if which == "2":
@@ -465,6 +535,8 @@ def manage_strategies_interactively(
             )
             save_strategies(strategies_path, strategies)
             print(f"Added built-in splitter {sid!r} ({splitter}). Saved to {strategies_path.name}")
+            if docs_root is not None and doc_ids:
+                _trigger_strategy_chunking_sync(docs_root, doc_ids, strategies[-1])
         elif choice == "d":
             idx_str = input("Enter number of strategy to delete (or blank to cancel): ").strip()
             if not idx_str:
@@ -600,21 +672,37 @@ def main() -> None:
     docs = load_documents(args.path)
     print(f"Loaded {len(docs)} document(s) from {args.path}")
 
-    # Load saved strategies if present; otherwise default to one built-in splitter.
+    # Load saved strategies if present; otherwise use default baseline and cue worker.
     strategies = load_strategies(STRATEGIES_FILE)
     if strategies is None:
-        strategies = [
-            Strategy(
-                id="s_default",
-                kind="builtin_splitter",
-                instruction="Sentence-based splitting (LlamaIndex default, chunk_size=1024)",
-                splitter="sentence",
-            ),
-        ]
+        print()
+        print("=" * 70)
+        print("  WARNING: No strategy file found (or file empty/invalid).")
+        print("  Using the default BASELINE strategy only (built-in splitter, NOT LLM).")
+        print("  The worker will be cued to backfill chunks for this strategy.")
+        print("  Ensure the Temporal worker is running (python temporal_worker.py).")
+        print("=" * 70)
+        print()
+        strategies = [DEFAULT_BASELINE_STRATEGY]
+        # Write a strategy file so the active strategy set is explicit/persistent.
+        try:
+            save_strategies(STRATEGIES_FILE, strategies)
+            print(f"Wrote default strategies to {STRATEGIES_FILE.resolve()}")
+            if not STRATEGIES_FILE.exists():
+                print(
+                    f"[WARN] Tried to write {STRATEGIES_FILE.resolve()} but it still does not exist.",
+                    file=sys.stderr,
+                )
+        except Exception as e:
+            print(f"[WARN] Could not write {STRATEGIES_FILE.resolve()}: {e}", file=sys.stderr)
         if args.strategy:
             strategies.append(
                 Strategy(id=args.strategy_id, kind="llm", instruction=args.strategy),
             )
+        # Cue the worker to backfill the default baseline so the user gets chunks.
+        docs_root = Path(args.path).resolve().parent if Path(args.path).resolve().is_file() else Path(args.path).resolve()
+        doc_ids = [getattr(d, "id_", "") for d in docs]
+        _trigger_strategy_chunking_sync(docs_root, doc_ids, DEFAULT_BASELINE_STRATEGY)
     else:
         print(f"Loaded {len(strategies)} strategy(ies) from {STRATEGIES_FILE.name}")
         if args.strategy:
@@ -627,19 +715,37 @@ def main() -> None:
     print("Index built (embeddings computed).")
 
     if args.interactive:
+        last_cache_mtimes = get_strategy_cache_mtimes([s.id for s in strategies])
         print(
             f"\n{len(nodes)} chunks formed from {len(strategies)} strategy(ies). "
-            "Enter a question (or 'quit' / 'q' to exit). You'll see retrieval then LLM response each time."
+            "Enter a question (or 'quit'/'q' to exit). Index is rebuilt automatically when the worker updates the cache."
         )
         while True:
+            # Before each prompt: if worker wrote new chunks, rebuild index from cache (no user action needed).
+            if cache_updated_since([s.id for s in strategies], last_cache_mtimes):
+                try:
+                    index, nodes = build_index_for_strategies(strategies, docs, quiet=True)
+                    last_cache_mtimes = get_strategy_cache_mtimes([s.id for s in strategies])
+                    print(f"\n  [Cache updated by worker; index rebuilt with {len(nodes)} chunks.]")
+                except Exception as e:
+                    # Don't crash the session if embeddings fail; keep the previous index.
+                    print(f"\n  [WARN] Cache updated but index rebuild failed: {e}", file=sys.stderr)
             try:
                 q = input("\nYour question: ").strip()
             except (EOFError, KeyboardInterrupt):
                 print("\nBye.")
                 break
-            if not q or q.lower() in ("quit", "q", "exit"):
+            if not q:
+                # Empty input should just reprompt (don't exit).
+                continue
+            if q.lower() in ("quit", "q", "exit"):
                 print("Bye.")
                 break
+            if q.lower() in ("reload", "r"):
+                index, nodes = build_index_for_strategies(strategies, docs, quiet=True)
+                last_cache_mtimes = get_strategy_cache_mtimes([s.id for s in strategies])
+                print(f"Index rebuilt: {len(nodes)} chunks.")
+                continue
             run_query_with_feedback(
                 index, q, top_k=args.top_k,
                 total_chunks=len(nodes), strategy_ids=[s.id for s in strategies],
@@ -649,7 +755,11 @@ def main() -> None:
                 "Was this answer correct? [y]es / [n]o / [i]ncomplete / [s]kip: "
             ).strip().lower()
             if fb in ("n", "i"):
-                manage_strategies_interactively(strategies, STRATEGIES_FILE)
+                manage_strategies_interactively(
+                    strategies, STRATEGIES_FILE,
+                    docs_root=Path(args.path).resolve(),
+                    doc_ids=[getattr(d, "id_", "") for d in docs],
+                )
                 # Rebuild index after any strategy changes
                 index, nodes = build_index_for_strategies(strategies, docs)
                 print(

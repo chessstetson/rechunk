@@ -221,6 +221,71 @@ async def test_builtin_chunking_runs_inside_temporal(tmp_path):
         os.environ.pop("RECHUNK_STRATEGY_CACHE_DIR", None)
 
 
+@pytest.mark.asyncio
+async def test_builtin_splitter_on_txt_and_docx_tree(tmp_path):
+    """
+    Built-in splitter activity on a small directory tree with .txt and .docx.
+    Verifies the worker uses extract_file_content (not raw read_text) so PDF/DOCX work.
+    """
+    os.environ["RECHUNK_STRATEGY_CACHE_DIR"] = str(tmp_path)
+    try:
+        # Simulate docs tree: subdir with one .txt and one .docx
+        sub = tmp_path / "subdir"
+        sub.mkdir()
+        txt_path = sub / "doc.txt"
+        txt_path.write_text("TXT content. Second sentence here.", encoding="utf-8")
+        docx_path = sub / "doc.docx"
+        try:
+            import docx  # type: ignore[import]
+            d = docx.Document()
+            d.add_paragraph("DOCX content. Another sentence in Word.")
+            d.save(str(docx_path))
+        except ImportError:
+            pytest.skip("python-docx required for DOCX test")
+
+        doc_ids = ["subdir/doc.txt", "subdir/doc.docx"]
+        from temporal_activities import (
+            LoadDocManifestInput,
+            BuiltinChunkInput,
+            chunk_doc_with_builtin_splitter,
+            load_doc_manifest,
+        )
+
+        env = ActivityEnvironment()
+        manifest = await env.run(
+            load_doc_manifest,
+            LoadDocManifestInput(docs_root=str(tmp_path), doc_ids=doc_ids),
+        )
+        assert len(manifest) == 2, "manifest should include both .txt and .docx (extract_file_content used)"
+        by_id = {m["doc_id"]: m["content_hash"] for m in manifest}
+        assert "subdir/doc.txt" in by_id
+        assert "subdir/doc.docx" in by_id
+
+        strategy_id = "test_builtin_txt_docx"
+        for m in manifest:
+            await env.run(
+                chunk_doc_with_builtin_splitter,
+                BuiltinChunkInput(
+                    strategy_id=strategy_id,
+                    splitter="sentence",
+                    docs_root=str(tmp_path),
+                    doc_id=m["doc_id"],
+                    content_hash=m["content_hash"],
+                ),
+            )
+
+        loaded = load_chunk_cache(strategy_id)
+        assert len(loaded) == 2
+        texts = set()
+        for nodes in loaded.values():
+            for n in nodes:
+                texts.add(n.text.strip())
+        assert any("TXT content" in t for t in texts)
+        assert any("DOCX content" in t or "Word" in t for t in texts)
+    finally:
+        os.environ.pop("RECHUNK_STRATEGY_CACHE_DIR", None)
+
+
 @pytest.mark.skipif(
     not os.environ.get("OPENAI_API_KEY"),
     reason="Set OPENAI_API_KEY to run real LLM chunking test (run manually)",
@@ -275,7 +340,50 @@ async def test_real_llm_chunking_in_activity(tmp_path):
         os.environ.pop("RECHUNK_STRATEGY_CACHE_DIR", None)
 
 
-# --- Step 1.5: Verify retries (workflow + worker; one activity fails once, retry succeeds) ---
+# --- Phase 2: load_doc_manifest and get_cached_hashes activities ---
+
+
+@pytest.mark.asyncio
+async def test_load_doc_manifest_and_get_cached_hashes(tmp_path):
+    """Phase 2: load_doc_manifest returns doc_id+content_hash; get_cached_hashes returns hashes in cache."""
+    os.environ["RECHUNK_STRATEGY_CACHE_DIR"] = str(tmp_path)
+    try:
+        (tmp_path / "a.txt").write_text("Alpha", encoding="utf-8")
+        (tmp_path / "b.txt").write_text("Beta", encoding="utf-8")
+        from temporal_activities import (
+            GetCachedHashesInput,
+            LoadDocManifestInput,
+            get_cached_hashes,
+            load_doc_manifest,
+        )
+
+        env = ActivityEnvironment()
+        manifest = await env.run(
+            load_doc_manifest,
+            LoadDocManifestInput(docs_root=str(tmp_path), doc_ids=["a.txt", "b.txt"]),
+        )
+        assert len(manifest) == 2
+        doc_ids = {m["doc_id"] for m in manifest}
+        assert doc_ids == {"a.txt", "b.txt"}
+        hash_alpha = compute_content_hash("Alpha")
+        hash_beta = compute_content_hash("Beta")
+        hashes = {m["content_hash"] for m in manifest}
+        assert hashes == {hash_alpha, hash_beta}
+
+        # Empty cache -> get_cached_hashes returns []
+        cached = await env.run(get_cached_hashes, GetCachedHashesInput(strategy_id="s_phase2"))
+        assert cached == []
+
+        # After appending one doc's chunks, get_cached_hashes returns that hash
+        append_chunk_cache("s_phase2", hash_alpha, [TextNode(text="x", metadata={})])
+        cached = await env.run(get_cached_hashes, GetCachedHashesInput(strategy_id="s_phase2"))
+        assert hash_alpha in cached
+        assert hash_beta not in cached
+    finally:
+        os.environ.pop("RECHUNK_STRATEGY_CACHE_DIR", None)
+
+
+# --- Step 1.5: Verify retries (workflow + worker; one doc fails once, retry succeeds) ---
 
 TASK_QUEUE_RETRY = "rechunk-strategy-chunking"
 
@@ -300,8 +408,13 @@ async def test_activity_retry_one_doc_fails_then_succeeds(tmp_path):
         from temporalio.worker import Worker
         from temporalio.testing import WorkflowEnvironment
 
-        from temporal_activities import chunk_doc_with_strategy as real_chunk_doc_with_strategy
-        from temporal_activities import ChunkDocInput
+        from temporal_activities import (
+            ChunkDocInput,
+            chunk_doc_with_strategy as real_chunk_doc_with_strategy,
+            get_cached_hashes,
+            load_doc_manifest,
+            log_workflow_summary,
+        )
         from temporal_workflows import StrategyChunkingWorkflow, StrategyChunkingInput
 
         # Wrapper: fail on first attempt only for fail_once.txt (simulated rate-limit).
@@ -349,16 +462,23 @@ async def test_activity_retry_one_doc_fails_then_succeeds(tmp_path):
                     env.client,
                     task_queue=TASK_QUEUE_RETRY,
                     workflows=[StrategyChunkingWorkflow],
-                    activities=[chunk_doc_fail_once_then_ok],
+                    activities=[
+                        chunk_doc_fail_once_then_ok,
+                        load_doc_manifest,
+                        get_cached_hashes,
+                        log_workflow_summary,
+                    ],
                 )
                 worker_task = asyncio.create_task(worker.run())
                 try:
                     workflow_input = StrategyChunkingInput(
                         strategy_id="test_retry",
-                        strategy_instruction="Split.",
-                        model=None,
+                        kind="llm",
                         docs_root=str(tmp_path),
                         doc_ids=["ok.txt", "fail_once.txt"],
+                        strategy_instruction="Split.",
+                        model=None,
+                        splitter="sentence",
                     )
                     handle = await env.client.start_workflow(
                         StrategyChunkingWorkflow.run,

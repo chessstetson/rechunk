@@ -15,7 +15,82 @@ from llama_index.core import Document
 from llama_index.core.node_parser import SentenceSplitter, TokenTextSplitter
 
 from rechunk import LLMNodeParser
-from rechunk.cache import append_chunk_cache, compute_content_hash
+from rechunk.cache import (
+    append_chunk_cache,
+    compute_content_hash,
+    get_cached_hashes_for_strategy,
+)
+from rechunk.doc_loader import extract_file_content
+
+
+@dataclass
+class LoadDocManifestInput:
+    """Input for load_doc_manifest activity. Returns list of {doc_id, content_hash}."""
+
+    docs_root: str
+    doc_ids: list
+
+
+@activity.defn
+async def load_doc_manifest(input: LoadDocManifestInput) -> list:
+    """
+    Read each document from disk and compute content hash. Returns list of
+    {"doc_id": str, "content_hash": str}. Skips docs that cannot be read.
+    """
+    import sys
+
+    docs_root = Path(input.docs_root)
+    manifest = []
+    for doc_id in input.doc_ids:
+        path = docs_root / doc_id
+        if not path.exists():
+            continue
+        text = extract_file_content(path)
+        if not text or not text.strip():
+            continue
+        content_hash = compute_content_hash(text)
+        manifest.append({"doc_id": doc_id, "content_hash": content_hash})
+    print(f"      [manifest] {len(manifest)} docs (of {len(input.doc_ids)} requested)", file=sys.stderr, flush=True)
+    return manifest
+
+
+@dataclass
+class GetCachedHashesInput:
+    """Input for get_cached_hashes activity. Returns list of content_hash in cache."""
+
+    strategy_id: str
+
+
+@activity.defn
+async def get_cached_hashes(input: GetCachedHashesInput) -> list:
+    """Return all content_hash values already in the strategy's chunk cache."""
+    import sys
+
+    hashes = get_cached_hashes_for_strategy(input.strategy_id)
+    print(f"      [cache] {input.strategy_id!r}: {len(hashes)} doc(s) already chunked", file=sys.stderr, flush=True)
+    return hashes
+
+
+@dataclass
+class LogWorkflowSummaryInput:
+    """Input for log_workflow_summary. Prints one line to stderr so the worker shows feedback."""
+
+    strategy_id: str
+    total: int
+    skipped: int
+    processed: int
+
+
+@activity.defn
+async def log_workflow_summary(input: LogWorkflowSummaryInput) -> None:
+    """Print workflow completion summary to stderr so the worker terminal shows feedback."""
+    import sys
+
+    msg = (
+        f"ReChunk workflow rechunk-{input.strategy_id} completed: "
+        f"{input.total} total, {input.skipped} already cached, {input.processed} chunked."
+    )
+    print(msg, file=sys.stderr, flush=True)
 
 
 @dataclass
@@ -37,8 +112,8 @@ class ChunkDocInput:
 async def chunk_doc_with_strategy(input: ChunkDocInput) -> None:
     """Chunk one document with an LLM strategy and append results to the shared cache."""
     doc_path = Path(input.docs_root) / input.doc_id
-    text = doc_path.read_text(encoding="utf-8", errors="replace")
-    if not text.strip():
+    text = extract_file_content(doc_path)
+    if not text or not text.strip():
         return
 
     content_hash = input.content_hash or compute_content_hash(text)
@@ -67,8 +142,8 @@ class BuiltinChunkInput:
 async def chunk_doc_with_builtin_splitter(input: BuiltinChunkInput) -> None:
     """Chunk one document with a LlamaIndex built-in splitter and append to cache."""
     doc_path = Path(input.docs_root) / input.doc_id
-    text = doc_path.read_text(encoding="utf-8", errors="replace")
-    if not text.strip():
+    text = extract_file_content(doc_path)
+    if not text or not text.strip():
         return
 
     chunk_size, chunk_overlap = 1024, 20
