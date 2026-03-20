@@ -7,9 +7,12 @@ to backfill chunks for each strategy; this script only reads from storage/strate
 chunking (LLM or built-in) itself.
 
 Usage:
-  python scripts/run_with_docs.py <path>                    # index from cache, then remind to use --query
-  python scripts/run_with_docs.py <path> --query "?"         # one query with retrieval + LLM feedback
-  python scripts/run_with_docs.py <path> --interactive        # index from cache, then prompt for questions
+  python scripts/run_with_docs.py <path>                     # filesystem corpus → index from cache
+  python scripts/run_with_docs.py --manifest hashes.json ...   # hash-only manifest (no paths on wire)
+  python scripts/run_with_docs.py <path> --query "?"          # one query with retrieval + LLM
+  python scripts/run_with_docs.py <path> --interactive       # prompt for questions
+
+Generate a manifest: python scripts/write_corpus_manifest.py <path> out.json
 
 Requires OPENAI_API_KEY for LLM synthesis at query time.
 """
@@ -17,6 +20,7 @@ Requires OPENAI_API_KEY for LLM synthesis at query time.
 import argparse
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 # Project root and src on path (rechunk + temporal_workflows)
@@ -31,7 +35,8 @@ from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.llms.openai import OpenAI
 
 from rechunk.cache import cache_updated_since, get_strategy_cache_mtimes
-from rechunk.documents import load_documents
+from rechunk.corpus import ContentRef, scan_filesystem_corpus
+from rechunk.hash_manifest import load_content_refs_from_manifest
 from rechunk.rag_index import build_vector_index_from_strategies
 from rechunk.retrieval import retrieve_top_k, synthesize_with_retrieved_nodes
 from rechunk.strategies import (
@@ -51,7 +56,7 @@ CHUNK_PREVIEW_LEN = 280
 
 def _wait_until_non_empty_index_or_quit(
     strategies: list[Strategy],
-    docs: list,
+    content_refs: Sequence[ContentRef],
     index: VectorStoreIndex,
     nodes: list,
     last_cache_mtimes: dict[str, float],
@@ -73,7 +78,7 @@ def _wait_until_non_empty_index_or_quit(
     while len(nodes) == 0:
         if cache_updated_since(strategy_ids, last_cache_mtimes):
             try:
-                index, nodes = build_vector_index_from_strategies(strategies, docs, quiet=True)
+                index, nodes = build_vector_index_from_strategies(strategies, content_refs, quiet=True)
                 last_cache_mtimes = get_strategy_cache_mtimes(strategy_ids)
                 if len(nodes) > 0:
                     print(f"\n  [Cache updated; index now has {len(nodes)} chunks.]")
@@ -95,7 +100,7 @@ def _wait_until_non_empty_index_or_quit(
             return None
         # Enter, "r", "reload" → try rebuild
         try:
-            index, nodes = build_vector_index_from_strategies(strategies, docs, quiet=True)
+            index, nodes = build_vector_index_from_strategies(strategies, content_refs, quiet=True)
             last_cache_mtimes = get_strategy_cache_mtimes(strategy_ids)
             if len(nodes) == 0:
                 print("  Still 0 chunks. Keep the worker running or verify storage/strategies cache files.")
@@ -251,8 +256,16 @@ def main() -> None:
     )
     parser.add_argument(
         "path",
+        nargs="?",
         type=Path,
-        help="Path to a .txt file or directory containing .txt files",
+        default=None,
+        help="Filesystem corpus root or file (omit if using --manifest)",
+    )
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="JSON file: array of SHA-256 hex strings only, or {\"content_hashes\": [...]}",
     )
     parser.add_argument(
         "--strategy-id",
@@ -287,12 +300,31 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if (args.path is None) == (args.manifest is None):
+        parser.error("Provide exactly one of: corpus path OR --manifest PATH (not both, not neither).")
+
+    manifest_mode = args.manifest is not None
+
     # Use OpenAI for LLM and embeddings (reads OPENAI_API_KEY from env)
     Settings.llm = OpenAI(model=args.model, temperature=0.1)
     Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
 
-    docs = load_documents(args.path)
-    print(f"Loaded {len(docs)} document(s) from {args.path}")
+    if manifest_mode:
+        content_refs = load_content_refs_from_manifest(args.manifest)
+        doc_ids: list[str] = []
+        docs_root: Path | None = None
+        print(
+            f"Manifest (hash-only): {len(content_refs)} content hash(es) from {args.manifest} "
+            "(no filesystem corpus scan for Q&A)."
+        )
+    else:
+        docs_path = Path(args.path).resolve()
+        docs_root = docs_path.parent if docs_path.is_file() else docs_path
+        content_refs, doc_ids = scan_filesystem_corpus(Path(args.path))
+        print(
+            f"Corpus scan: {len(content_refs)} unique content object(s) by hash from {args.path} "
+            f"(full text not kept in memory for Q&A)."
+        )
 
     # Load saved strategies if present; otherwise use default baseline and cue worker.
     strategies = load_strategies(STRATEGIES_FILE)
@@ -301,7 +333,11 @@ def main() -> None:
         print("=" * 70)
         print("  WARNING: No strategy file found (or file empty/invalid).")
         print("  Using the default BASELINE strategy only (built-in splitter, NOT LLM).")
-        print("  The worker will be cued to backfill chunks for this strategy.")
+        if manifest_mode:
+            print("  Manifest mode: this tool will not start a Temporal workflow (no path list on wire).")
+            print("  Run scripts/start_strategy_chunking.py with your corpus root, or use a filesystem path once.")
+        else:
+            print("  The worker will be cued to backfill chunks for this strategy.")
         print("  Ensure the Temporal worker is running (python temporal_worker.py).")
         print("=" * 70)
         print()
@@ -321,10 +357,8 @@ def main() -> None:
             strategies.append(
                 Strategy(id=args.strategy_id, kind="llm", instruction=args.strategy),
             )
-        # Cue the worker to backfill the default baseline so the user gets chunks.
-        docs_root = Path(args.path).resolve().parent if Path(args.path).resolve().is_file() else Path(args.path).resolve()
-        doc_ids = [getattr(d, "id_", "") for d in docs]
-        trigger_strategy_chunking_sync(docs_root, doc_ids, DEFAULT_BASELINE_STRATEGY)
+        if not manifest_mode and docs_root is not None:
+            trigger_strategy_chunking_sync(docs_root, doc_ids, DEFAULT_BASELINE_STRATEGY)
     else:
         print(f"Loaded {len(strategies)} strategy(ies) from {STRATEGIES_FILE.name}")
         if args.strategy:
@@ -332,7 +366,7 @@ def main() -> None:
                 Strategy(id=args.strategy_id, kind="llm", instruction=args.strategy),
             )
 
-    index, nodes = build_vector_index_from_strategies(strategies, docs)
+    index, nodes = build_vector_index_from_strategies(strategies, content_refs)
     print(f"ReChunk produced {len(nodes)} nodes across {len(strategies)} strategy(ies)")
     print("Index built (embeddings computed).")
 
@@ -340,7 +374,7 @@ def main() -> None:
         last_cache_mtimes = get_strategy_cache_mtimes([s.id for s in strategies])
         if len(nodes) == 0:
             waited = _wait_until_non_empty_index_or_quit(
-                strategies, docs, index, nodes, last_cache_mtimes
+                strategies, content_refs, index, nodes, last_cache_mtimes
             )
             if waited is None:
                 return
@@ -353,7 +387,7 @@ def main() -> None:
             # Before each prompt: if worker wrote new chunks, rebuild index from cache (no user action needed).
             if cache_updated_since([s.id for s in strategies], last_cache_mtimes):
                 try:
-                    index, nodes = build_vector_index_from_strategies(strategies, docs, quiet=True)
+                    index, nodes = build_vector_index_from_strategies(strategies, content_refs, quiet=True)
                     last_cache_mtimes = get_strategy_cache_mtimes([s.id for s in strategies])
                     print(f"\n  [Cache updated by worker; index rebuilt with {len(nodes)} chunks.]")
                     if len(nodes) == 0:
@@ -375,13 +409,13 @@ def main() -> None:
                 print("Bye.")
                 break
             if q.lower() in ("reload", "r"):
-                index, nodes = build_vector_index_from_strategies(strategies, docs, quiet=True)
+                index, nodes = build_vector_index_from_strategies(strategies, content_refs, quiet=True)
                 last_cache_mtimes = get_strategy_cache_mtimes([s.id for s in strategies])
                 print(f"Index rebuilt: {len(nodes)} chunks.")
                 if len(nodes) == 0:
                     print("  Index is still empty; questions are disabled until chunks exist.")
                     waited = _wait_until_non_empty_index_or_quit(
-                        strategies, docs, index, nodes, last_cache_mtimes
+                        strategies, content_refs, index, nodes, last_cache_mtimes
                     )
                     if waited is None:
                         break
@@ -403,11 +437,11 @@ def main() -> None:
             if fb in ("n", "i"):
                 manage_strategies_interactively(
                     strategies, STRATEGIES_FILE,
-                    docs_root=Path(args.path).resolve(),
-                    doc_ids=[getattr(d, "id_", "") for d in docs],
+                    docs_root=docs_root,
+                    doc_ids=doc_ids,
                 )
                 # Rebuild index after any strategy changes
-                index, nodes = build_vector_index_from_strategies(strategies, docs)
+                index, nodes = build_vector_index_from_strategies(strategies, content_refs)
                 print(
                     f"\nRebuilt index: {len(nodes)} chunks from {len(strategies)} strategy(ies)."
                 )

@@ -7,10 +7,13 @@ Chunking is performed elsewhere (Temporal worker); this module only reads
 
 from __future__ import annotations
 
-from llama_index.core import Document, VectorStoreIndex
+from collections.abc import Sequence
+
+from llama_index.core import VectorStoreIndex
 from llama_index.core.schema import BaseNode, MetadataMode, TextNode
 
 from rechunk.cache import load_chunk_cache
+from rechunk.corpus import ContentRef
 from rechunk.strategies import Strategy
 
 
@@ -93,7 +96,7 @@ def split_long_nodes_for_embedding(
 
 def collect_pooled_nodes_from_strategy_caches(
     strategies: list[Strategy],
-    docs: list[Document],
+    content_refs: Sequence[ContentRef],
     *,
     quiet: bool = False,
 ) -> list[BaseNode]:
@@ -102,22 +105,23 @@ def collect_pooled_nodes_from_strategy_caches(
     (pooling). Does not split for embedding limits or build an index.
     """
     all_nodes: list[BaseNode] = []
-    n_docs = len(docs)
+    n_docs = len(content_refs)
     for idx, s in enumerate(strategies, 1):
         if not quiet:
-            print(f"\n  Strategy {idx}/{len(strategies)}: {s.id} ({s.kind}) — {n_docs} documents")
+            print(f"\n  Strategy {idx}/{len(strategies)}: {s.id} ({s.kind}) — {n_docs} content object(s)")
         cache = load_chunk_cache(s.id)
         strat_nodes: list[BaseNode] = []
-        for j, doc in enumerate(docs, 1):
-            content_hash = (doc.metadata or {}).get("content_hash") if hasattr(doc, "metadata") else None
-            if content_hash and content_hash in cache:
+        for j, ref in enumerate(content_refs, 1):
+            content_hash = ref.content_hash
+            label = ref.source_hint or content_hash[:12] + "..."
+            if content_hash in cache:
                 strat_nodes.extend(cache[content_hash])
                 if not quiet:
-                    print(f"    [{j}/{n_docs}] cache hit for hash={content_hash[:12]}... ({doc.id_})")
+                    print(f"    [{j}/{n_docs}] cache hit for hash={content_hash[:12]}... ({label})")
             else:
                 if not quiet:
                     print(
-                        f"    [{j}/{n_docs}] no cached chunks for {getattr(doc, 'id_', '?')!r} (strategy {s.id}); "
+                        f"    [{j}/{n_docs}] no cached chunks for {label!r} (strategy {s.id}); "
                         "run worker + start_strategy_chunking to backfill."
                     )
         all_nodes.extend(strat_nodes)
@@ -130,7 +134,7 @@ def collect_pooled_nodes_from_strategy_caches(
 
 def build_vector_index_from_strategies(
     strategies: list[Strategy],
-    docs: list[Document],
+    content_refs: Sequence[ContentRef],
     *,
     quiet: bool = False,
 ) -> tuple[VectorStoreIndex, list[BaseNode]]:
@@ -138,7 +142,7 @@ def build_vector_index_from_strategies(
     Build index from cache only. All chunking is done by the Temporal worker;
     callers never run chunking here.
     """
-    all_nodes = collect_pooled_nodes_from_strategy_caches(strategies, docs, quiet=quiet)
+    all_nodes = collect_pooled_nodes_from_strategy_caches(strategies, content_refs, quiet=quiet)
     all_nodes = split_long_nodes_for_embedding(all_nodes)
     if not quiet:
         print(f"  Total after max-length enforcement: {len(all_nodes)} chunks")

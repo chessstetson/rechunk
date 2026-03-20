@@ -6,10 +6,10 @@ import tempfile
 from pathlib import Path
 
 import pytest
-from llama_index.core import Document
 from llama_index.core.schema import TextNode
 
 from rechunk.cache import append_chunk_cache, compute_content_hash
+from rechunk.corpus import ContentRef
 from rechunk.rag_index import (
     collect_pooled_nodes_from_strategy_caches,
     split_long_nodes_for_embedding,
@@ -28,7 +28,7 @@ def isolated_cache_dir(monkeypatch: pytest.MonkeyPatch) -> Path:
 def test_collect_pooled_nodes_merges_two_strategies(isolated_cache_dir: Path) -> None:
     text = "hello pooled world"
     h = compute_content_hash(text)
-    doc = Document(text=text, id_="a.txt", metadata={"content_hash": h})
+    ref = ContentRef(content_hash=h, source_hint="a.txt")
 
     n1 = TextNode(id_="n1", text="chunk A", metadata={"strategy": "s_a"})
     n2 = TextNode(id_="n2", text="chunk B", metadata={"strategy": "s_b"})
@@ -40,7 +40,7 @@ def test_collect_pooled_nodes_merges_two_strategies(isolated_cache_dir: Path) ->
         Strategy(id="s_a", kind="builtin_splitter", instruction="a"),
         Strategy(id="s_b", kind="builtin_splitter", instruction="b"),
     ]
-    pooled = collect_pooled_nodes_from_strategy_caches(strategies, [doc], quiet=True)
+    pooled = collect_pooled_nodes_from_strategy_caches(strategies, [ref], quiet=True)
     assert len(pooled) == 2
     texts = {getattr(n, "text", "") for n in pooled}
     assert texts == {"chunk A", "chunk B"}
@@ -60,7 +60,7 @@ def test_split_long_nodes_char_fallback_splits_oversized() -> None:
 
 
 def test_collect_pooled_empty_when_cache_missing() -> None:
-    doc = Document(text="z", id_="z.txt", metadata={"content_hash": compute_content_hash("z")})
+    ref = ContentRef(content_hash=compute_content_hash("z"), source_hint="z.txt")
     strategies = [Strategy(id="missing_strategy", kind="builtin_splitter", instruction="x")]
-    pooled = collect_pooled_nodes_from_strategy_caches(strategies, [doc], quiet=True)
+    pooled = collect_pooled_nodes_from_strategy_caches(strategies, [ref], quiet=True)
     assert pooled == []
