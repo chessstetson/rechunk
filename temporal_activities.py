@@ -31,6 +31,38 @@ class LoadDocManifestInput:
     doc_ids: list
 
 
+@dataclass
+class LoadIngestSnapshotInput:
+    """Path to ingest snapshot JSON (written before workflow start; worker reads same filesystem)."""
+
+    snapshot_path: str
+
+
+@activity.defn
+async def load_manifest_from_ingest_snapshot(input: LoadIngestSnapshotInput) -> dict:
+    """
+    Read ingest snapshot, verify each file's hash matches disk, return ``docs_root`` + ``manifest``.
+
+    Workflow history stays small (path only); doc list and hashes live in the snapshot file.
+    """
+    import sys
+
+    from temporalio.exceptions import ApplicationError
+
+    from rechunk.ingest_snapshot import read_ingest_snapshot
+
+    try:
+        docs_root, manifest = read_ingest_snapshot(Path(input.snapshot_path))
+    except (FileNotFoundError, ValueError, OSError) as e:
+        raise ApplicationError(str(e), non_retryable=True) from e
+    print(
+        f"      [ingest_snapshot] {len(manifest)} docs from {input.snapshot_path}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return {"docs_root": str(docs_root), "manifest": manifest}
+
+
 @activity.defn
 async def load_doc_manifest(input: LoadDocManifestInput) -> list:
     """

@@ -10,6 +10,7 @@ import asyncio
 import sys
 from pathlib import Path
 
+from rechunk.ingest_snapshot import build_and_write_ingest_snapshot
 from rechunk.strategies import Strategy
 
 # Must match ``temporal_worker.py`` task queue for strategy chunking.
@@ -41,13 +42,17 @@ def trigger_strategy_chunking_sync(
     async def _run() -> None:
         client = await Client.connect(temporal_address)
         workflow_id = f"rechunk-{strategy.id}"
+        snapshot_path = build_and_write_ingest_snapshot(
+            docs_root.resolve(),
+            doc_ids,
+            strategy_id=strategy.id,
+        )
         await client.start_workflow(
             StrategyChunkingWorkflow,
             StrategyChunkingInput(
                 strategy_id=strategy.id,
                 kind=strategy.kind,
-                docs_root=str(docs_root.resolve()),
-                doc_ids=doc_ids,
+                ingest_snapshot_path=str(snapshot_path),
                 strategy_instruction=strategy.instruction if strategy.kind == "llm" else None,
                 model=getattr(strategy, "model", None),
                 splitter=getattr(strategy, "splitter", "sentence"),

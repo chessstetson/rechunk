@@ -24,6 +24,23 @@ from rechunk.cache import (
 )
 
 
+def test_ingest_snapshot_build_and_read_roundtrip(tmp_path):
+    """Snapshot written at trigger time matches disk when read in activity path."""
+    (tmp_path / "a.txt").write_text("hello snapshot", encoding="utf-8")
+    os.environ["RECHUNK_INGEST_SNAPSHOT_DIR"] = str(tmp_path / "snap_out")
+    try:
+        from rechunk.ingest_snapshot import build_and_write_ingest_snapshot, read_ingest_snapshot
+
+        snap = build_and_write_ingest_snapshot(tmp_path, ["a.txt"], strategy_id="t_roundtrip")
+        root, manifest = read_ingest_snapshot(snap)
+        assert root == tmp_path.resolve()
+        assert len(manifest) == 1
+        assert manifest[0]["doc_id"] == "a.txt"
+        assert manifest[0]["content_hash"] == compute_content_hash("hello snapshot")
+    finally:
+        os.environ.pop("RECHUNK_INGEST_SNAPSHOT_DIR", None)
+
+
 def test_compute_content_hash():
     h = compute_content_hash("hello world")
     assert isinstance(h, str)
@@ -408,11 +425,13 @@ async def test_activity_retry_one_doc_fails_then_succeeds(tmp_path):
         from temporalio.worker import Worker
         from temporalio.testing import WorkflowEnvironment
 
+        from rechunk.ingest_snapshot import build_and_write_ingest_snapshot
+
         from temporal_activities import (
             ChunkDocInput,
             chunk_doc_with_strategy as real_chunk_doc_with_strategy,
             get_cached_hashes,
-            load_doc_manifest,
+            load_manifest_from_ingest_snapshot,
             log_workflow_summary,
             merge_active_corpus_manifest,
         )
@@ -447,6 +466,13 @@ async def test_activity_retry_one_doc_fails_then_succeeds(tmp_path):
 
         active_manifest = tmp_path / "active_corpus_hashes.json"
         os.environ["RECHUNK_ACTIVE_CORPUS_MANIFEST"] = str(active_manifest)
+        snap_dir = tmp_path / "ingest_snapshots"
+        os.environ["RECHUNK_INGEST_SNAPSHOT_DIR"] = str(snap_dir)
+        snapshot_path = build_and_write_ingest_snapshot(
+            tmp_path,
+            ["ok.txt", "fail_once.txt"],
+            strategy_id="test_retry",
+        )
 
         with patch(
             "rechunk.node_parser.LLMNodeParser.get_nodes_from_documents",
@@ -468,7 +494,7 @@ async def test_activity_retry_one_doc_fails_then_succeeds(tmp_path):
                     workflows=[StrategyChunkingWorkflow],
                     activities=[
                         chunk_doc_fail_once_then_ok,
-                        load_doc_manifest,
+                        load_manifest_from_ingest_snapshot,
                         get_cached_hashes,
                         log_workflow_summary,
                         merge_active_corpus_manifest,
@@ -479,8 +505,7 @@ async def test_activity_retry_one_doc_fails_then_succeeds(tmp_path):
                     workflow_input = StrategyChunkingInput(
                         strategy_id="test_retry",
                         kind="llm",
-                        docs_root=str(tmp_path),
-                        doc_ids=["ok.txt", "fail_once.txt"],
+                        ingest_snapshot_path=str(snapshot_path),
                         strategy_instruction="Split.",
                         model=None,
                         splitter="sentence",
@@ -511,3 +536,4 @@ async def test_activity_retry_one_doc_fails_then_succeeds(tmp_path):
     finally:
         os.environ.pop("RECHUNK_STRATEGY_CACHE_DIR", None)
         os.environ.pop("RECHUNK_ACTIVE_CORPUS_MANIFEST", None)
+        os.environ.pop("RECHUNK_INGEST_SNAPSHOT_DIR", None)

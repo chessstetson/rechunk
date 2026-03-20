@@ -22,9 +22,8 @@ class LogWorkflowSummaryInput:
 
 
 @dataclass
-class LoadDocManifestInput:
-    docs_root: str
-    doc_ids: List[str]
+class LoadIngestSnapshotInput:
+    snapshot_path: str
 
 
 @dataclass
@@ -62,8 +61,7 @@ class StrategyChunkingInput:
 
     strategy_id: str
     kind: str  # "llm" or "builtin_splitter"
-    docs_root: str
-    doc_ids: List[str]
+    ingest_snapshot_path: str  # JSON: docs_root + per-doc hashes (see rechunk.ingest_snapshot)
     strategy_instruction: Optional[str] = None  # for kind=llm
     model: Optional[str] = None  # for kind=llm
     splitter: str = "sentence"  # for kind=builtin_splitter: "sentence" or "token"
@@ -75,12 +73,14 @@ class StrategyChunkingWorkflow:
 
     @workflow.run
     async def run(self, input: StrategyChunkingInput) -> dict:
-        # 2.1: Load manifest (doc_id -> content_hash) and cached hashes; skip already-cached docs.
-        manifest: List[dict] = await workflow.execute_activity(
-            "load_doc_manifest",
-            LoadDocManifestInput(docs_root=input.docs_root, doc_ids=input.doc_ids),
+        # 2.1: Resolve manifest from ingest snapshot (I/O in activity; workflow history keeps path only).
+        loaded: dict = await workflow.execute_activity(
+            "load_manifest_from_ingest_snapshot",
+            LoadIngestSnapshotInput(snapshot_path=input.ingest_snapshot_path),
             start_to_close_timeout=timedelta(minutes=10),
         )
+        docs_root: str = loaded["docs_root"]
+        manifest: List[dict] = loaded["manifest"]
         cached_hashes_list: List[str] = await workflow.execute_activity(
             "get_cached_hashes",
             GetCachedHashesInput(strategy_id=input.strategy_id),
@@ -101,7 +101,7 @@ class StrategyChunkingWorkflow:
                         BuiltinChunkInput(
                             strategy_id=input.strategy_id,
                             splitter=input.splitter,
-                            docs_root=input.docs_root,
+                            docs_root=docs_root,
                             doc_id=m["doc_id"],
                             content_hash=m["content_hash"],
                         ),
@@ -116,7 +116,7 @@ class StrategyChunkingWorkflow:
                             strategy_id=input.strategy_id,
                             strategy_instruction=input.strategy_instruction or "",
                             model=input.model,
-                            docs_root=input.docs_root,
+                            docs_root=docs_root,
                             doc_id=m["doc_id"],
                             content_hash=m["content_hash"],
                         ),

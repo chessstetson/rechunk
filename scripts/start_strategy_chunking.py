@@ -25,9 +25,12 @@ import argparse
 import sys
 from pathlib import Path
 
-# Project root on path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# Project root and ``src`` on path (package lives under ``src/``).
+_project_root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_project_root / "src"))
+sys.path.insert(0, str(_project_root))
 
+from rechunk.ingest_snapshot import build_and_write_ingest_snapshot
 from temporalio.client import Client
 from temporal_workflows import StrategyChunkingInput, StrategyChunkingWorkflow
 
@@ -87,6 +90,11 @@ async def main() -> None:
         sys.exit(1)
 
     kind = "builtin_splitter" if args.kind == "builtin" else "llm"
+    snapshot_path = build_and_write_ingest_snapshot(
+        docs_root,
+        doc_ids,
+        strategy_id=args.strategy_id,
+    )
     client = await Client.connect(args.address)
     workflow_id = f"rechunk-{args.strategy_id}"
     handle = await client.start_workflow(
@@ -94,8 +102,7 @@ async def main() -> None:
         StrategyChunkingInput(
             strategy_id=args.strategy_id,
             kind=kind,
-            docs_root=str(docs_root),
-            doc_ids=doc_ids,
+            ingest_snapshot_path=str(snapshot_path),
             strategy_instruction=args.instruction if kind == "llm" else None,
             model=None,
             splitter=args.splitter,

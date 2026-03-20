@@ -100,6 +100,7 @@ This document breaks down the **ReChunk × Temporal development plan** (e.g. `re
 ### Step 2.1 — Skip-if-cached in the workflow
 
 - [x] **2.1.1** Add an Activity `load_doc_manifest(docs_root, doc_ids)` (or equivalent) that returns a list of `{doc_id, content_hash}` by reading each doc from disk and computing hash. Workflow must not do I/O; Activity does. **Done:** `load_doc_manifest` in `temporal_activities.py`; `get_cached_hashes_for_strategy` in `rechunk.cache`.
+- [x] **2.1.1b** **Ingest snapshot (workflow history):** `StrategyChunkingInput` carries `ingest_snapshot_path` only. Before `start_workflow`, `rechunk.ingest_snapshot.build_and_write_ingest_snapshot` writes JSON under `storage/ingest_snapshots/` (or `RECHUNK_INGEST_SNAPSHOT_DIR`). Activity `load_manifest_from_ingest_snapshot` reads it and re-verifies hashes from disk. **`load_doc_manifest` remains** for direct/tests; the workflow uses the snapshot path.
 - [x] **2.1.2** Add a way for the workflow to know which `(strategy_id, content_hash)` pairs are already cached. **Done:** Activity `get_cached_hashes(strategy_id)` reads the strategy JSONL and returns list of `content_hash`.
 - [x] **2.1.3** In `StrategyChunkingWorkflow.run`, after loading manifest and cached set, build the list of tasks only for docs where `content_hash not in cached_hashes`. **Done.**
 

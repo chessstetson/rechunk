@@ -35,3 +35,5 @@ storage/
 
 # OS
 .DS_Store
+CORPUS_REFACTOR_PLAN.md
+rechunk_strategies.json

@@ -15,6 +15,7 @@ from temporal_activities import (
     chunk_doc_with_strategy,
     get_cached_hashes,
     load_doc_manifest,
+    load_manifest_from_ingest_snapshot,
     log_workflow_summary,
     merge_active_corpus_manifest,
 )
@@ -34,6 +35,7 @@ async def main() -> None:
             chunk_doc_with_strategy,
             chunk_doc_with_builtin_splitter,
             load_doc_manifest,
+            load_manifest_from_ingest_snapshot,
             get_cached_hashes,
             log_workflow_summary,
             merge_active_corpus_manifest,

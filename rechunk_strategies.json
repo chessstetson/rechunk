@@ -1,9 +1,0 @@
-[
-  {
-    "id": "s_admin_protocols",
-    "kind": "llm",
-    "instruction": "\"Find all instances of admin protocols; each instance is a separate chunk\"",
-    "splitter": "sentence",
-    "model": null
-  }
-]
