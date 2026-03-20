@@ -8,6 +8,7 @@ Chunking is performed elsewhere (Temporal worker); this module only reads
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
 from llama_index.core import VectorStoreIndex
 from llama_index.core.schema import BaseNode, MetadataMode, TextNode
@@ -137,10 +138,13 @@ def build_vector_index_from_strategies(
     content_refs: Sequence[ContentRef],
     *,
     quiet: bool = False,
+    embed_model: Any | None = None,
 ) -> tuple[VectorStoreIndex, list[BaseNode]]:
     """
     Build index from cache only. All chunking is done by the Temporal worker;
     callers never run chunking here.
+
+    If ``embed_model`` is ``None``, LlamaIndex uses :attr:`Settings.embed_model`.
     """
     all_nodes = collect_pooled_nodes_from_strategy_caches(strategies, content_refs, quiet=quiet)
     all_nodes = split_long_nodes_for_embedding(all_nodes)
@@ -148,11 +152,84 @@ def build_vector_index_from_strategies(
         print(f"  Total after max-length enforcement: {len(all_nodes)} chunks")
 
     try:
-        index = VectorStoreIndex(all_nodes)
+        index = (
+            VectorStoreIndex(all_nodes, embed_model=embed_model)
+            if embed_model is not None
+            else VectorStoreIndex(all_nodes)
+        )
     except Exception as e:
         raise RuntimeError(
             "Failed to build VectorStoreIndex (embedding step). "
             "This usually means one chunk exceeded the embed token limit or the embedding API failed. "
             "Try rerunning, or reduce chunk sizes."
         ) from e
+    return index, all_nodes
+
+
+def load_or_build_vector_index_from_strategies(
+    strategies: list[Strategy],
+    content_refs: Sequence[ContentRef],
+    *,
+    embed_model: Any,
+    quiet: bool = False,
+    use_disk_cache: bool = True,
+) -> tuple[VectorStoreIndex, list[BaseNode]]:
+    """
+    Like :func:`build_vector_index_from_strategies`, but reuses a persisted
+    :class:`VectorStoreIndex` when strategy ids, content hashes, chunk-cache mtimes,
+    and embedding model fingerprint match (see ``rechunk.vector_index_cache``).
+    """
+    from rechunk.cache import get_strategy_cache_mtimes
+    from rechunk.vector_index_cache import (
+        compute_vector_index_cache_key,
+        disk_cache_disabled,
+        embed_model_fingerprint,
+        persist_dir_for_cache_key,
+        persist_vector_index,
+        try_load_vector_index_from_disk,
+    )
+
+    strategy_ids = [s.id for s in strategies]
+    mtimes = get_strategy_cache_mtimes(strategy_ids)
+    hashes = [ref.content_hash for ref in content_refs]
+    use_disk = use_disk_cache and not disk_cache_disabled()
+    emb_fp = embed_model_fingerprint(embed_model)
+
+    if use_disk:
+        key = compute_vector_index_cache_key(
+            strategy_ids=strategy_ids,
+            content_hashes=hashes,
+            strategy_cache_mtimes=mtimes,
+            embed_model_fp=emb_fp,
+        )
+        persist_dir = persist_dir_for_cache_key(key)
+        loaded = try_load_vector_index_from_disk(persist_dir, embed_model)
+        if loaded is not None:
+            nodes = list(loaded.docstore.docs.values())
+            if not quiet:
+                print(
+                    f"  Vector index loaded from disk cache ({key[:12]}…, {len(nodes)} chunks). "
+                    f"Use --no-vector-index-cache to force re-embed."
+                )
+            return loaded, nodes
+
+    index, all_nodes = build_vector_index_from_strategies(
+        strategies, content_refs, quiet=quiet, embed_model=embed_model
+    )
+    if use_disk:
+        key = compute_vector_index_cache_key(
+            strategy_ids=strategy_ids,
+            content_hashes=hashes,
+            strategy_cache_mtimes=mtimes,
+            embed_model_fp=emb_fp,
+        )
+        persist_dir = persist_dir_for_cache_key(key)
+        try:
+            persist_vector_index(index, persist_dir)
+            if not quiet:
+                print(f"  Saved vector index to disk cache ({key[:12]}…).")
+        except Exception as e:
+            if not quiet:
+                print(f"  [WARN] Could not persist vector index cache: {e}", flush=True)
+
     return index, all_nodes

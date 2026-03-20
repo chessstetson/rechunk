@@ -18,6 +18,10 @@ After a successful StrategyChunkingWorkflow, the worker merges manifest hashes i
 storage/corpus_content_hashes.json (override with RECHUNK_ACTIVE_CORPUS_MANIFEST).
 Then: python scripts/run_with_docs.py --manifest storage/corpus_content_hashes.json --interactive
 
+Vector embeddings are cached on disk under storage/vector_index_cache/ (keyed by strategy ids,
+content hashes, chunk-cache mtimes, embed model). Override dir with RECHUNK_VECTOR_INDEX_CACHE_DIR;
+disable with --no-vector-index-cache or RECHUNK_NO_VECTOR_INDEX_CACHE=1.
+
 Requires OPENAI_API_KEY for LLM synthesis at query time.
 """
 
@@ -41,7 +45,7 @@ from llama_index.llms.openai import OpenAI
 from rechunk.cache import cache_updated_since, get_strategy_cache_mtimes
 from rechunk.corpus import ContentRef
 from rechunk.corpus_manager import FilesystemCorpusManager, HashManifestCorpusManager
-from rechunk.rag_index import build_vector_index_from_strategies
+from rechunk.rag_index import load_or_build_vector_index_from_strategies
 from rechunk.retrieval import retrieve_top_k, synthesize_with_retrieved_nodes
 from rechunk.strategies import (
     DEFAULT_BASELINE_STRATEGY,
@@ -64,6 +68,8 @@ def _wait_until_non_empty_index_or_quit(
     index: VectorStoreIndex,
     nodes: list,
     last_cache_mtimes: dict[str, float],
+    *,
+    use_disk_cache: bool,
 ) -> tuple[VectorStoreIndex, list, dict[str, float]] | None:
     """
     While the pooled index has zero nodes, do not offer the normal question prompt.
@@ -82,7 +88,13 @@ def _wait_until_non_empty_index_or_quit(
     while len(nodes) == 0:
         if cache_updated_since(strategy_ids, last_cache_mtimes):
             try:
-                index, nodes = build_vector_index_from_strategies(strategies, content_refs, quiet=True)
+                index, nodes = load_or_build_vector_index_from_strategies(
+                    strategies,
+                    content_refs,
+                    embed_model=Settings.embed_model,
+                    quiet=True,
+                    use_disk_cache=use_disk_cache,
+                )
                 last_cache_mtimes = get_strategy_cache_mtimes(strategy_ids)
                 if len(nodes) > 0:
                     print(f"\n  [Cache updated; index now has {len(nodes)} chunks.]")
@@ -104,7 +116,13 @@ def _wait_until_non_empty_index_or_quit(
             return None
         # Enter, "r", "reload" → try rebuild
         try:
-            index, nodes = build_vector_index_from_strategies(strategies, content_refs, quiet=True)
+            index, nodes = load_or_build_vector_index_from_strategies(
+                strategies,
+                content_refs,
+                embed_model=Settings.embed_model,
+                quiet=True,
+                use_disk_cache=use_disk_cache,
+            )
             last_cache_mtimes = get_strategy_cache_mtimes(strategy_ids)
             if len(nodes) == 0:
                 print("  Still 0 chunks. Keep the worker running or verify storage/strategies cache files.")
@@ -302,6 +320,11 @@ def main() -> None:
         default="gpt-4o-mini",
         help="OpenAI model for chunking (default: gpt-4o-mini)",
     )
+    parser.add_argument(
+        "--no-vector-index-cache",
+        action="store_true",
+        help="Always recompute embeddings; do not load/save disk cache (see RECHUNK_VECTOR_INDEX_CACHE_DIR)",
+    )
     args = parser.parse_args()
 
     if (args.path is None) == (args.manifest is None):
@@ -312,6 +335,8 @@ def main() -> None:
     # Use OpenAI for LLM and embeddings (reads OPENAI_API_KEY from env)
     Settings.llm = OpenAI(model=args.model, temperature=0.1)
     Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
+
+    use_disk_cache = not args.no_vector_index_cache
 
     if manifest_mode:
         corpus_manager: FilesystemCorpusManager | HashManifestCorpusManager = HashManifestCorpusManager(
@@ -368,15 +393,26 @@ def main() -> None:
                 Strategy(id=args.strategy_id, kind="llm", instruction=args.strategy),
             )
 
-    index, nodes = build_vector_index_from_strategies(strategies, content_refs)
+    index, nodes = load_or_build_vector_index_from_strategies(
+        strategies,
+        content_refs,
+        embed_model=Settings.embed_model,
+        quiet=False,
+        use_disk_cache=use_disk_cache,
+    )
     print(f"ReChunk produced {len(nodes)} nodes across {len(strategies)} strategy(ies)")
-    print("Index built (embeddings computed).")
+    print("Index ready (embeddings from cache or API).")
 
     if args.interactive:
         last_cache_mtimes = get_strategy_cache_mtimes([s.id for s in strategies])
         if len(nodes) == 0:
             waited = _wait_until_non_empty_index_or_quit(
-                strategies, content_refs, index, nodes, last_cache_mtimes
+                strategies,
+                content_refs,
+                index,
+                nodes,
+                last_cache_mtimes,
+                use_disk_cache=use_disk_cache,
             )
             if waited is None:
                 return
@@ -389,7 +425,13 @@ def main() -> None:
             # Before each prompt: if worker wrote new chunks, rebuild index from cache (no user action needed).
             if cache_updated_since([s.id for s in strategies], last_cache_mtimes):
                 try:
-                    index, nodes = build_vector_index_from_strategies(strategies, content_refs, quiet=True)
+                    index, nodes = load_or_build_vector_index_from_strategies(
+                        strategies,
+                        content_refs,
+                        embed_model=Settings.embed_model,
+                        quiet=True,
+                        use_disk_cache=use_disk_cache,
+                    )
                     last_cache_mtimes = get_strategy_cache_mtimes([s.id for s in strategies])
                     print(f"\n  [Cache updated by worker; index rebuilt with {len(nodes)} chunks.]")
                     if len(nodes) == 0:
@@ -411,13 +453,24 @@ def main() -> None:
                 print("Bye.")
                 break
             if q.lower() in ("reload", "r"):
-                index, nodes = build_vector_index_from_strategies(strategies, content_refs, quiet=True)
+                index, nodes = load_or_build_vector_index_from_strategies(
+                    strategies,
+                    content_refs,
+                    embed_model=Settings.embed_model,
+                    quiet=True,
+                    use_disk_cache=use_disk_cache,
+                )
                 last_cache_mtimes = get_strategy_cache_mtimes([s.id for s in strategies])
                 print(f"Index rebuilt: {len(nodes)} chunks.")
                 if len(nodes) == 0:
                     print("  Index is still empty; questions are disabled until chunks exist.")
                     waited = _wait_until_non_empty_index_or_quit(
-                        strategies, content_refs, index, nodes, last_cache_mtimes
+                        strategies,
+                        content_refs,
+                        index,
+                        nodes,
+                        last_cache_mtimes,
+                        use_disk_cache=use_disk_cache,
                     )
                     if waited is None:
                         break
@@ -443,7 +496,13 @@ def main() -> None:
                     doc_ids=doc_ids,
                 )
                 # Rebuild index after any strategy changes
-                index, nodes = build_vector_index_from_strategies(strategies, content_refs)
+                index, nodes = load_or_build_vector_index_from_strategies(
+                    strategies,
+                    content_refs,
+                    embed_model=Settings.embed_model,
+                    quiet=False,
+                    use_disk_cache=use_disk_cache,
+                )
                 print(
                     f"\nRebuilt index: {len(nodes)} chunks from {len(strategies)} strategy(ies)."
                 )
