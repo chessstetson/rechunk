@@ -35,8 +35,8 @@ from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.llms.openai import OpenAI
 
 from rechunk.cache import cache_updated_since, get_strategy_cache_mtimes
-from rechunk.corpus import ContentRef, scan_filesystem_corpus
-from rechunk.hash_manifest import load_content_refs_from_manifest
+from rechunk.corpus import ContentRef
+from rechunk.corpus_manager import FilesystemCorpusManager, HashManifestCorpusManager
 from rechunk.rag_index import build_vector_index_from_strategies
 from rechunk.retrieval import retrieve_top_k, synthesize_with_retrieved_nodes
 from rechunk.strategies import (
@@ -310,21 +310,19 @@ def main() -> None:
     Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
 
     if manifest_mode:
-        content_refs = load_content_refs_from_manifest(args.manifest)
-        doc_ids: list[str] = []
-        docs_root: Path | None = None
-        print(
-            f"Manifest (hash-only): {len(content_refs)} content hash(es) from {args.manifest} "
-            "(no filesystem corpus scan for Q&A)."
+        corpus_manager: FilesystemCorpusManager | HashManifestCorpusManager = HashManifestCorpusManager(
+            args.manifest
         )
     else:
-        docs_path = Path(args.path).resolve()
-        docs_root = docs_path.parent if docs_path.is_file() else docs_path
-        content_refs, doc_ids = scan_filesystem_corpus(Path(args.path))
-        print(
-            f"Corpus scan: {len(content_refs)} unique content object(s) by hash from {args.path} "
-            f"(full text not kept in memory for Q&A)."
-        )
+        corpus_manager = FilesystemCorpusManager(Path(args.path))
+
+    content_refs = corpus_manager.list_active_content_refs()
+    hints = corpus_manager.temporal_ingest_hints()
+    if hints is not None:
+        docs_root, doc_ids = hints.docs_root, hints.doc_ids
+    else:
+        docs_root, doc_ids = None, []
+    print(corpus_manager.summary_message(len(content_refs)))
 
     # Load saved strategies if present; otherwise use default baseline and cue worker.
     strategies = load_strategies(STRATEGIES_FILE)
