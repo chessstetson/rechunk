@@ -16,6 +16,7 @@ from temporal_activities import (
     get_cached_hashes,
     load_doc_manifest,
     log_workflow_summary,
+    merge_active_corpus_manifest,
 )
 from temporal_workflows import StrategyChunkingWorkflow
 
@@ -35,6 +36,7 @@ async def main() -> None:
             load_doc_manifest,
             get_cached_hashes,
             log_workflow_summary,
+            merge_active_corpus_manifest,
         ],
     )
     await worker.run()

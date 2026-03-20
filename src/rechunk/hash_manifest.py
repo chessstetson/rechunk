@@ -33,6 +33,11 @@ def _normalize_hash(h: str) -> str:
     return s
 
 
+def normalize_content_hash(h: str) -> str:
+    """Validate and return lowercase SHA-256 hex (64 chars)."""
+    return _normalize_hash(h)
+
+
 def load_content_refs_from_manifest(manifest_path: Path) -> list[ContentRef]:
     """
     Load :class:`ContentRef` instances (hash only, no ``source_hint``) from JSON.

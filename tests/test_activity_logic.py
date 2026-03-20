@@ -414,6 +414,7 @@ async def test_activity_retry_one_doc_fails_then_succeeds(tmp_path):
             get_cached_hashes,
             load_doc_manifest,
             log_workflow_summary,
+            merge_active_corpus_manifest,
         )
         from temporal_workflows import StrategyChunkingWorkflow, StrategyChunkingInput
 
@@ -444,6 +445,9 @@ async def test_activity_retry_one_doc_fails_then_succeeds(tmp_path):
                 return mock_nodes_a
             return mock_nodes_b
 
+        active_manifest = tmp_path / "active_corpus_hashes.json"
+        os.environ["RECHUNK_ACTIVE_CORPUS_MANIFEST"] = str(active_manifest)
+
         with patch(
             "rechunk.node_parser.LLMNodeParser.get_nodes_from_documents",
             side_effect=mock_get_nodes,
@@ -467,6 +471,7 @@ async def test_activity_retry_one_doc_fails_then_succeeds(tmp_path):
                         load_doc_manifest,
                         get_cached_hashes,
                         log_workflow_summary,
+                        merge_active_corpus_manifest,
                     ],
                 )
                 worker_task = asyncio.create_task(worker.run())
@@ -493,6 +498,10 @@ async def test_activity_retry_one_doc_fails_then_succeeds(tmp_path):
                     assert hash_b in loaded, "Second doc should be in cache after retry"
                     assert len(loaded[hash_a]) >= 1
                     assert len(loaded[hash_b]) >= 1
+                    import json
+
+                    merged = json.loads(active_manifest.read_text(encoding="utf-8"))
+                    assert hash_a in merged and hash_b in merged
                 finally:
                     worker_task.cancel()
                     try:
@@ -501,3 +510,4 @@ async def test_activity_retry_one_doc_fails_then_succeeds(tmp_path):
                         pass
     finally:
         os.environ.pop("RECHUNK_STRATEGY_CACHE_DIR", None)
+        os.environ.pop("RECHUNK_ACTIVE_CORPUS_MANIFEST", None)

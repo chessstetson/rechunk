@@ -94,6 +94,41 @@ async def log_workflow_summary(input: LogWorkflowSummaryInput) -> None:
 
 
 @dataclass
+class MergeActiveCorpusManifestInput:
+    """Content hashes from this workflow's doc manifest (SHA-256 hex strings)."""
+
+    content_hashes: list
+
+
+@activity.defn
+async def merge_active_corpus_manifest(input: MergeActiveCorpusManifestInput) -> dict:
+    """
+    Merge workflow manifest hashes into the shared active corpus file (hash-only JSON).
+
+    Ingest owns this artifact; Q&A can ``--manifest`` the same path. See
+    ``rechunk.active_corpus_manifest``.
+    """
+    from rechunk.active_corpus_manifest import (
+        active_corpus_manifest_path,
+        merge_content_hashes_into_active_manifest,
+    )
+
+    path = active_corpus_manifest_path()
+    if not input.content_hashes:
+        return {"total_unique_hashes": 0, "path": str(path)}
+    import sys
+
+    merged = merge_content_hashes_into_active_manifest(input.content_hashes)
+    print(
+        f"      [active_corpus] merged {len(input.content_hashes)} hash(es) from workflow → "
+        f"{len(merged)} unique in {path}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return {"total_unique_hashes": len(merged), "path": str(path)}
+
+
+@dataclass
 class ChunkDocInput:
     """Input for chunk_doc_with_strategy activity.
 

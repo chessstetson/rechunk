@@ -14,6 +14,10 @@ Usage:
 
 Generate a manifest: python scripts/write_corpus_manifest.py <path> out.json
 
+After a successful StrategyChunkingWorkflow, the worker merges manifest hashes into
+storage/corpus_content_hashes.json (override with RECHUNK_ACTIVE_CORPUS_MANIFEST).
+Then: python scripts/run_with_docs.py --manifest storage/corpus_content_hashes.json --interactive
+
 Requires OPENAI_API_KEY for LLM synthesis at query time.
 """
 

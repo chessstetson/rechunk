@@ -52,6 +52,11 @@ class BuiltinChunkInput:
 
 
 @dataclass
+class MergeActiveCorpusManifestInput:
+    content_hashes: List[str]
+
+
+@dataclass
 class StrategyChunkingInput:
     """Input for StrategyChunkingWorkflow. One strategy, many docs. Supports LLM and built-in."""
 
@@ -130,4 +135,12 @@ class StrategyChunkingWorkflow:
             ),
             start_to_close_timeout=timedelta(seconds=10),
         )
+        # Ingest-owned active corpus (hash-only); merged on every successful workflow completion.
+        if manifest:
+            unique_hashes = sorted({m["content_hash"] for m in manifest})
+            await workflow.execute_activity(
+                "merge_active_corpus_manifest",
+                MergeActiveCorpusManifestInput(content_hashes=unique_hashes),
+                start_to_close_timeout=timedelta(minutes=2),
+            )
         return {"total": total, "skipped": skipped, "processed": processed}
