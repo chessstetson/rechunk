@@ -49,6 +49,62 @@ STRATEGIES_FILE = Path(__file__).resolve().parent.parent / "rechunk_strategies.j
 CHUNK_PREVIEW_LEN = 280
 
 
+def _wait_until_non_empty_index_or_quit(
+    strategies: list[Strategy],
+    docs: list,
+    index: VectorStoreIndex,
+    nodes: list,
+    last_cache_mtimes: dict[str, float],
+) -> tuple[VectorStoreIndex, list, dict[str, float]] | None:
+    """
+    While the pooled index has zero nodes, do not offer the normal question prompt.
+
+    Lets the user reload from cache (or picks up worker writes via mtime) until chunks
+    exist, or they quit. Returns None if the user exits early.
+    """
+    strategy_ids = [s.id for s in strategies]
+    print(
+        "\nNo embedding chunks are indexed yet — retrieval cannot run.\n"
+        "Start the Temporal worker and wait for the strategy cache to backfill, then press "
+        "Enter here to reload from cache (or type r). The cache is also checked automatically "
+        "when it changes.\n"
+        "Quit with q when done."
+    )
+    while len(nodes) == 0:
+        if cache_updated_since(strategy_ids, last_cache_mtimes):
+            try:
+                index, nodes = build_vector_index_from_strategies(strategies, docs, quiet=True)
+                last_cache_mtimes = get_strategy_cache_mtimes(strategy_ids)
+                if len(nodes) > 0:
+                    print(f"\n  [Cache updated; index now has {len(nodes)} chunks.]")
+                    break
+            except Exception as e:
+                print(f"\n  [WARN] Cache updated but index rebuild failed: {e}", file=sys.stderr)
+                last_cache_mtimes = get_strategy_cache_mtimes(strategy_ids)
+
+        if len(nodes) > 0:
+            break
+
+        try:
+            cmd = input("\n[Enter] or [r] reload from cache  |  [q] quit: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye.")
+            return None
+        if cmd in ("q", "quit", "exit"):
+            print("Bye.")
+            return None
+        # Enter, "r", "reload" → try rebuild
+        try:
+            index, nodes = build_vector_index_from_strategies(strategies, docs, quiet=True)
+            last_cache_mtimes = get_strategy_cache_mtimes(strategy_ids)
+            if len(nodes) == 0:
+                print("  Still 0 chunks. Keep the worker running or verify storage/strategies cache files.")
+        except Exception as e:
+            print(f"  [WARN] Index rebuild failed: {e}", file=sys.stderr)
+
+    return index, nodes, last_cache_mtimes
+
+
 def manage_strategies_interactively(
     strategies: list[Strategy],
     strategies_path: Path,
@@ -282,6 +338,13 @@ def main() -> None:
 
     if args.interactive:
         last_cache_mtimes = get_strategy_cache_mtimes([s.id for s in strategies])
+        if len(nodes) == 0:
+            waited = _wait_until_non_empty_index_or_quit(
+                strategies, docs, index, nodes, last_cache_mtimes
+            )
+            if waited is None:
+                return
+            index, nodes, last_cache_mtimes = waited
         print(
             f"\n{len(nodes)} chunks formed from {len(strategies)} strategy(ies). "
             "Enter a question (or 'quit'/'q' to exit). Index is rebuilt automatically when the worker updates the cache."
@@ -293,6 +356,10 @@ def main() -> None:
                     index, nodes = build_vector_index_from_strategies(strategies, docs, quiet=True)
                     last_cache_mtimes = get_strategy_cache_mtimes([s.id for s in strategies])
                     print(f"\n  [Cache updated by worker; index rebuilt with {len(nodes)} chunks.]")
+                    if len(nodes) == 0:
+                        print(
+                            "  (Index is still empty — use [r] reload or wait for more cache writes before asking.)"
+                        )
                 except Exception as e:
                     # Don't crash the session if embeddings fail; keep the previous index.
                     print(f"\n  [WARN] Cache updated but index rebuild failed: {e}", file=sys.stderr)
@@ -311,6 +378,19 @@ def main() -> None:
                 index, nodes = build_vector_index_from_strategies(strategies, docs, quiet=True)
                 last_cache_mtimes = get_strategy_cache_mtimes([s.id for s in strategies])
                 print(f"Index rebuilt: {len(nodes)} chunks.")
+                if len(nodes) == 0:
+                    print("  Index is still empty; questions are disabled until chunks exist.")
+                    waited = _wait_until_non_empty_index_or_quit(
+                        strategies, docs, index, nodes, last_cache_mtimes
+                    )
+                    if waited is None:
+                        break
+                    index, nodes, last_cache_mtimes = waited
+                continue
+            if len(nodes) == 0:
+                print(
+                    "  No chunks in the index; cannot answer. Use [r] reload or wait for the worker, then try again."
+                )
                 continue
             run_query_with_feedback(
                 index, q, top_k=args.top_k,
@@ -332,6 +412,16 @@ def main() -> None:
                     f"\nRebuilt index: {len(nodes)} chunks from {len(strategies)} strategy(ies)."
                 )
     elif args.query:
+        if len(nodes) == 0:
+            print(
+                "Cannot run --query: the index has no chunks yet (strategy cache is empty or not backfilled).",
+                file=sys.stderr,
+            )
+            print(
+                "Start the Temporal worker, wait for storage/strategies to fill, then retry.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         run_query_with_feedback(
             index, args.query, top_k=args.top_k,
             total_chunks=len(nodes), strategy_ids=[s.id for s in strategies],
