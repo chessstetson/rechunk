@@ -85,28 +85,51 @@ python scripts/start_strategy_chunking.py s_default
 - At query time, retrieval runs over this union, and the retrieval log shows, for each top‑k hit:
   - The **source document** and the **strategy id** (`strategy=<id>`) that produced that chunk.
 
-## Quick start (v0.1 — single strategy, from code)
+### Quick demo
+![rechunk_quick_demo](https://github.com/user-attachments/assets/fb8d6dc5-f3f2-46a3-a58a-a053c70c9730)
 
-```python
-from llama_index.core import Document, VectorStoreIndex
-from llama_index.core import Settings
-from llama_index.llms.openai import OpenAI
+### System diagrams
 
-from rechunk import LLMNodeParser
+```mermaid
+flowchart TD
+    CLI["CLI / scripts"]:::client
 
-# Optional: set global LLM (otherwise uses LlamaIndex default)
-Settings.llm = OpenAI(model="gpt-4o-mini", temperature=0.1)
+    subgraph svc ["IndexService layer"]
+        IS["IndexService\nindex_service.py"]
+        CH["Chunker\ndiff + plan work items"]
+        CSI["corpus_snapshot_id\nderived from active hashes"]
+    end
 
-parser = LLMNodeParser(
-    strategy_id="s_sections",
-    strategy_instruction="Split the document by its structural divisions: chapters, headings, and subheadings. Each chunk is one section.",
-)
+    subgraph ecs ["ExtractedContentService"]
+        ECS["FilesystemExtractedContentService\nsource of truth for document content"]
+        ECSS["storage/ecs/\ncontent/ · state/active_logical.json"]
+    end
 
-docs = [Document(text="Your long document here...")]
-nodes = parser.get_nodes_from_documents(docs)
+    subgraph vs ["VectorStore"]
+        VS["FilesystemVectorStore\nrows + corpus collections"]
+        VSS["storage/vector_store_dev/\nrows/ · collections/"]
+    end
 
-index = VectorStoreIndex(nodes)
-# Query as usual
+    subgraph fp ["Key derivation"]
+        FP["fingerprints.py\nstrategy_fp · embedding_fp"]
+    end
+
+    CLI --> IS
+    IS --> CH
+    IS --> CSI
+    CH -->|list_active_hashes| ECS
+    CH -->|list_vectorized_hashes| VS
+    IS -->|get_content| ECS
+    IS -->|get_collection / put_collection| VS
+    CSI -.->|used by| VS
+    FP -.->|used by| CH
+    FP -.->|used by| VS
+    ECS --- ECSS
+    VS --- VSS
+
+    classDef client fill:#EEEDFE,stroke:#7F77DD,color:#3C3489
+    classDef store fill:#E1F5EE,stroke:#1D9E75,color:#085041
+    classDef derived fill:#F1EFE8,stroke:#888780,color:#444441
 ```
 
 ## Roadmap
