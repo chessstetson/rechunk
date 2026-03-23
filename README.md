@@ -20,6 +20,8 @@ Built on [LlamaIndex](https://www.llamaindex.ai/) and [Temporal](https://tempora
 
 Optional **local** docs (not tracked in git): `rechunk_strategy.md` (design / roadmap), `REPOSITORY_DESCRIPTION.md` (GitHub *About* blurb), `TEMPORAL_IMPLEMENTATION_STEPS.md` (implementation checklist).
 
+**Tracked design note — derived chunks (planned):** **[DERIVED_CHUNKS.md](DERIVED_CHUNKS.md)** describes the upcoming `derived` strategy kind (synthetic embeddable text + `source_spans`), dedup keys, persistence, and a **prominent “Future revisions”** section for how we might evolve the design.
+
 ## Install
 
 ```bash
