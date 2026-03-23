@@ -1,0 +1,44 @@
+# Virtual env
+.venv/
+venv/
+env/
+
+# Build / install
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Env / secrets (never commit API keys)
+.env
+.env.local
+*.env
+
+# User docs / local storage (never version-control; may contain sensitive or local content)
+docs/
+storage/
+
+# OS
+.DS_Store
+CORPUS_REFACTOR_PLAN.md
+rechunk_strategies.json
+
+# Local / maintainer docs (not versioned)
+TEMPORAL_IMPLEMENTATION_STEPS.md
+REPOSITORY_DESCRIPTION.md
+rechunk_strategy.md
