@@ -62,7 +62,7 @@ python scripts/prepare_hf_benchmark_corpus.py cuad --n 40
 python scripts/prepare_hf_benchmark_corpus.py pg19 --n 15 --split validation  # streams until n books; add --full-split to download whole split
 ```
 
-Defaults write under `storage/benchmark_corpora/<preset>/`. See **`scripts/BENCHMARK_CORPORA.md`** for flags and ingest commands.
+Defaults write under `docs/benchmark_corpora/<preset>/`. See **`scripts/BENCHMARK_CORPORA.md`** for flags and ingest commands.
 
 ### Temporal (ingest vs vectorization)
 

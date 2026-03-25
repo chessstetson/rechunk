@@ -25,7 +25,11 @@ class DocumentVectorizationInput:
 @dataclass
 class BatchDocumentVectorizationInput:
     """
-    One workflow run: call ``vectorize_content_for_strategy`` once per ``content_hash`` (sequential).
+    One workflow run: fan out ``vectorize_content_for_strategy`` for each ``content_hash``.
+
+    Activities are started in waves of ``fanout_batch_size`` (``asyncio.gather`` per wave) so
+    workflow-task replay stays bounded; within a wave, worker ``max_concurrent_activities`` limits
+    how many run at once.
 
     Easier to inspect in Temporal UI than N separate workflow executions.
     """
@@ -36,3 +40,4 @@ class BatchDocumentVectorizationInput:
     strategy_fingerprint: str
     embedding_fingerprint: str
     vector_schema_version: str
+    fanout_batch_size: int = 32

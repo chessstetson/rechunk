@@ -20,7 +20,11 @@ from rechunk.strategies import Strategy, strategy_to_dict
 from rechunk.temporal_queues import TASK_QUEUE_INGEST, TASK_QUEUE_VECTORIZATION
 from rechunk.vector_store import FilesystemVectorStore
 from rechunk.repo_paths import project_root
-from rechunk.vectorization_config import VECTOR_SCHEMA_VERSION
+from rechunk.vectorization_config import (
+    VECTOR_SCHEMA_VERSION,
+    batch_vectorization_fanout_batch_size,
+    batch_vectorization_workflow_task_timeout,
+)
 
 # Default strategies file (run_with_docs uses same path).
 _DEFAULT_STRATEGIES_PATH = project_root() / "rechunk_strategies.json"
@@ -71,6 +75,7 @@ async def _enqueue_batch_vectorization_for_strategy(
         strategy_fingerprint=sfp,
         embedding_fingerprint=efp,
         vector_schema_version=VECTOR_SCHEMA_VERSION,
+        fanout_batch_size=batch_vectorization_fanout_batch_size(),
     )
     wid = f"rechunk-batch-v12-{strategy.id}-{uuid.uuid4().hex[:12]}"
     await client.start_workflow(
@@ -79,6 +84,7 @@ async def _enqueue_batch_vectorization_for_strategy(
         id=wid,
         task_queue=TASK_QUEUE_VECTORIZATION,
         id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+        task_timeout=batch_vectorization_workflow_task_timeout(),
     )
     print(
         f"  Started BatchDocumentVectorizationWorkflow {wid!r} ({len(hashes)} hash(es)) "
