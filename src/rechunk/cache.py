@@ -2,7 +2,8 @@
 Shared strategy chunk cache for ReChunk.
 
 Used by the CLI and Temporal activities so both read/write the same
-storage/strategies/{strategy_id}_chunks.jsonl format. Storage directory can be
+storage/strategies/{strategy_id}_chunks.jsonl format (per-node ``id``, ``text``, ``metadata`` with
+``source_spans``, ``ref_doc_id``). Storage directory can be
 overridden via env RECHUNK_STRATEGY_CACHE_DIR for tests.
 
 Freshness: the cache exposes whether it has been updated since a previous
@@ -50,24 +51,16 @@ def _node_to_dict(node: TextNode) -> dict:
         "text": text,
         "metadata": getattr(node, "metadata", None) or {},
         "ref_doc_id": getattr(node, "ref_doc_id", None),
-        "start_char_idx": getattr(node, "start_char_idx", None),
-        "end_char_idx": getattr(node, "end_char_idx", None),
     }
 
 
 def _dict_to_node(d: dict) -> TextNode:
-    node = TextNode(
+    return TextNode(
         id_=d.get("id", ""),
         text=d.get("text", ""),
         metadata=d.get("metadata") or {},
         ref_doc_id=d.get("ref_doc_id"),
     )
-    start = d.get("start_char_idx")
-    end = d.get("end_char_idx")
-    if start is not None and end is not None:
-        node.start_char_idx = start
-        node.end_char_idx = end
-    return node
 
 
 def append_chunk_cache(strategy_id: str, content_hash: str, nodes: List[TextNode]) -> None:

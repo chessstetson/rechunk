@@ -61,10 +61,10 @@ async def main() -> None:
     parser.add_argument("strategy_id", help="Strategy ID (e.g. s_entities or s_default)")
     parser.add_argument(
         "--kind",
-        choices=("llm", "builtin"),
+        choices=("llm", "builtin", "derived"),
         default="builtin",
         help=(
-            "Fallback if strategy_id is missing from rechunk_strategies.json: llm or builtin. "
+            "Fallback if strategy_id is missing from rechunk_strategies.json: llm, derived, or builtin. "
             "If the id exists in the file, that file entry is used (see printed kind below)."
         ),
     )
@@ -106,11 +106,14 @@ async def main() -> None:
         strategy_id=args.strategy_id,
         cli_strategy=cli_strategy,
     )
-    chunking_mode = (
-        "LLM chunking (slow: one strategy call per doc)"
-        if strategy.kind == "llm"
-        else f"built-in splitter ({getattr(strategy, 'splitter', 'sentence')!r}, no chunking LLM)"
-    )
+    if strategy.kind == "derived":
+        chunking_mode = "derived nodes (LLM synthetic text + source_spans; slow)"
+    elif strategy.kind == "llm":
+        chunking_mode = "LLM verbatim chunking (slow: one strategy call per doc)"
+    else:
+        chunking_mode = (
+            f"built-in splitter ({getattr(strategy, 'splitter', 'sentence')!r}, no chunking LLM)"
+        )
     print(
         f"Resolved strategy {strategy.id!r}: kind={strategy.kind!r} → {chunking_mode}.",
         flush=True,

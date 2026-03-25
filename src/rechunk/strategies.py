@@ -17,11 +17,11 @@ class Strategy:
     """In-memory representation of a chunking strategy."""
 
     id: str
-    kind: str  # "builtin_splitter" (no LLM) or "llm"
+    kind: str  # "builtin_splitter" | "llm" | "derived"
     instruction: str
     # For kind="builtin_splitter": which LlamaIndex parser. "sentence" | "token"
     splitter: str = "sentence"
-    # For kind="llm": OpenAI model name (default gpt-4o-mini when None)
+    # For kind="llm" or "derived": OpenAI model name (default gpt-4o-mini when None)
     model: str | None = None
 
 
@@ -46,7 +46,7 @@ def strategy_to_dict(s: Strategy) -> dict:
 
 def normalize_strategy_kind(raw: object) -> str:
     """
-    Return ``\"llm\"`` or ``\"builtin_splitter\"``.
+    Return ``\"llm\"``, ``\"derived\"``, or ``\"builtin_splitter\"``.
 
     Missing, empty, or unrecognized values default to ``builtin_splitter`` so chunking
     does not silently require an LLM.
@@ -59,14 +59,21 @@ def normalize_strategy_kind(raw: object) -> str:
     sl = s.lower()
     if sl == "llm":
         return "llm"
+    if sl == "derived":
+        return "derived"
     if sl in ("builtin_splitter", "builtin"):
         return "builtin_splitter"
     return "builtin_splitter"
 
 
 def strategy_definition_uses_llm(sd: dict) -> bool:
-    """True only when normalized kind is ``llm`` (explicit instruction-driven chunking)."""
+    """True only when normalized kind is ``llm`` (verbatim / multi-span extraction chunking)."""
     return normalize_strategy_kind(sd.get("kind")) == "llm"
+
+
+def strategy_definition_uses_derived(sd: dict) -> bool:
+    """True when kind is ``derived`` (LLM-generated chunk text + ``source_spans`` provenance)."""
+    return normalize_strategy_kind(sd.get("kind")) == "derived"
 
 
 def dict_to_strategy(d: dict) -> Strategy:

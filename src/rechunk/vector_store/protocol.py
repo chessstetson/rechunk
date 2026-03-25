@@ -17,7 +17,7 @@ class VectorStore(Protocol):
     strategy/embedding/schema triple. A miss triggers assembly from rows for active hashes.
 
     Row dicts are implementation-defined but should include at least ``content_hash``,
-    ``span_start``, ``span_end``, and embedding payload per v12 plan.
+    ``chunk_text``, ``metadata`` (including ``source_spans``), and embedding payload.
     """
 
     def get_collection(

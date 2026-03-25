@@ -55,13 +55,16 @@ def test_extract_spans_single_start_end():
     assert _extract_spans_from_llm_chunk(c, doc_len=10) == [(1, 4)]
 
 
-def test_char_spans_uses_metadata_span_ranges_bbox():
+def test_char_spans_uses_metadata_source_spans_bbox():
     full = "aaabbbcccddd"
     node = TextNode(
         text="aaabbb",
-        metadata={"span_ranges": [[0, 3], [6, 9]]},
-        start_char_idx=0,
-        end_char_idx=9,
+        metadata={
+            "source_spans": [
+                {"start_char": 0, "end_char": 3},
+                {"start_char": 6, "end_char": 9},
+            ]
+        },
     )
     assert char_spans_for_nodes(full, [node]) == [(0, 9)]
 
@@ -109,12 +112,10 @@ def test_windowed_fallback_semi_overlapping():
     )
     assert len(nodes) >= 2
     assert nodes[0].text == "x" * 24_000
-    assert nodes[0].start_char_idx == 0
-    assert nodes[0].end_char_idx == 24_000
-    assert nodes[1].start_char_idx == 20_000  # step = 24k - 4k
-    assert nodes[1].end_char_idx == 30_000
     assert nodes[1].metadata["strategy"] == "s_test"
     assert nodes[1].metadata["source_doc"] == "doc1"
+    assert nodes[0].metadata["source_spans"] == [{"start_char": 0, "end_char": 24_000}]
+    assert nodes[1].metadata["source_spans"] == [{"start_char": 20_000, "end_char": 30_000}]
 
 
 def test_over_length_doc_uses_fallback_without_llm():
@@ -133,8 +134,9 @@ def test_over_length_doc_uses_fallback_without_llm():
     for n in nodes:
         assert n.metadata.get("strategy") == "s_len_test"
         assert n.metadata.get("source_doc") == "long_doc.txt"
-    assert nodes[0].start_char_idx == 0
-    assert nodes[0].end_char_idx == FALLBACK_WINDOW_CHARS
+    assert nodes[0].metadata["source_spans"] == [
+        {"start_char": 0, "end_char": FALLBACK_WINDOW_CHARS}
+    ]
     # IDs indicate length_fallback, not error_fallback or LLM chunks
     assert "length_fallback" in nodes[0].id_
 

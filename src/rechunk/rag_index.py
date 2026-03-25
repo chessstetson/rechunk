@@ -51,6 +51,12 @@ def split_long_nodes_for_embedding(
 
     result: list[BaseNode] = []
     for node in nodes:
+        meta_check = getattr(node, "metadata", None) or {}
+        if isinstance(meta_check, dict) and meta_check.get("derived"):
+            # Do not split synthetic derived text; provenance ``source_spans`` would no longer match.
+            result.append(node)
+            continue
+
         if hasattr(node, "get_content"):
             text = node.get_content(metadata_mode=MetadataMode.NONE)
         else:
@@ -71,8 +77,8 @@ def split_long_nodes_for_embedding(
             continue
 
         meta = dict(getattr(node, "metadata", None) or {})
-        # Split parts are arbitrary slices of ``text``; drop LLM span hints (single or multi).
-        meta.pop("span_ranges", None)
+        # Split parts are arbitrary slices of ``text``; drop provenance (re-filled after span map).
+        meta.pop("source_spans", None)
         ref_doc_id = getattr(node, "ref_doc_id", None) or meta.get("source_doc", "")
         base_id = getattr(node, "id_", None) or ref_doc_id or "node"
         part_idx = 1
@@ -155,17 +161,8 @@ def _text_node_from_vector_row(
         text = str(text or "")
     emb = row.get("embedding")
     meta = dict(row.get("metadata") or {})
-    span_s = row.get("span_start")
-    span_e = row.get("span_end")
-    if span_s is not None:
-        meta.setdefault("span_start", span_s)
-    if span_e is not None:
-        meta.setdefault("span_end", span_e)
-    sr = row.get("span_ranges")
-    if isinstance(sr, list) and sr:
-        meta.setdefault("span_ranges", sr)
     ref_doc = meta.get("source_doc") or content_hash[:16]
-    node_id = f"{content_hash[:16]}_{strategy_id}_{span_s}_{span_e}_{row_index}"
+    node_id = f"{content_hash[:16]}_{strategy_id}_{row_index}"
     embedding_list = list(emb) if isinstance(emb, list) else None
     return TextNode(
         id_=node_id,

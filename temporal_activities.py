@@ -2,7 +2,7 @@
 Temporal activities for ReChunk: chunk documents with a strategy and write to cache.
 
 Activities run in workers; they do I/O and LLM calls. Workflows only orchestrate.
-Two paths: LLM-based (chunk_doc_with_strategy) and LlamaIndex built-in (chunk_doc_with_builtin_splitter).
+Paths: built-in splitter, LLM verbatim chunks, and **derived** (synthetic text + ``source_spans``).
 """
 
 from dataclasses import dataclass
@@ -17,14 +17,15 @@ from llama_index.core import Document, Settings
 from llama_index.core.node_parser import SentenceSplitter, TokenTextSplitter
 from llama_index.core.schema import MetadataMode
 
-from rechunk import LLMNodeParser
-from rechunk.strategies import strategy_definition_uses_llm
+from rechunk import DerivedNodeParser, LLMNodeParser
+from rechunk.strategies import strategy_definition_uses_derived, strategy_definition_uses_llm
 from rechunk.cache import (
     append_chunk_cache,
     compute_content_hash,
     get_cached_hashes_for_strategy,
 )
 from rechunk.doc_loader import extract_file_content
+from rechunk.node_span_utils import ensure_metadata_source_spans_for_nodes
 from rechunk.rag_index import split_long_nodes_for_embedding
 
 
@@ -241,6 +242,7 @@ async def chunk_doc_with_strategy(input: ChunkDocInput) -> None:
     )
     # Uses Settings.llm when llm is None (set by CLI or worker)
     nodes = parser.get_nodes_from_documents([doc])
+    ensure_metadata_source_spans_for_nodes(text, nodes)
     append_chunk_cache(input.strategy_id, content_hash, nodes)
 
 
@@ -287,7 +289,6 @@ async def vectorize_content_for_strategy(input: DocumentVectorizationInput) -> d
     """
     import sys
 
-    from rechunk.node_span_utils import char_spans_for_nodes
     from rechunk.worker_runtime import get_worker_ecs, get_worker_vector_store
 
     ecs = get_worker_ecs()
@@ -323,7 +324,21 @@ async def vectorize_content_for_strategy(input: DocumentVectorizationInput) -> d
     sd = input.strategy_definition
     strategy_id = sd.get("id", input.strategy_id)
 
-    if not strategy_definition_uses_llm(sd):
+    if strategy_definition_uses_derived(sd):
+        doc = Document(text=text, id_=doc_id)
+        parser = DerivedNodeParser(
+            strategy_id=strategy_id,
+            strategy_instruction=sd.get("instruction", ""),
+        )
+        nodes = parser.get_nodes_from_documents([doc])
+    elif strategy_definition_uses_llm(sd):
+        doc = Document(text=text, id_=doc_id)
+        parser = LLMNodeParser(
+            strategy_id=strategy_id,
+            strategy_instruction=sd.get("instruction", ""),
+        )
+        nodes = parser.get_nodes_from_documents([doc])
+    else:
         splitter = sd.get("splitter", "sentence")
         chunk_size, chunk_overlap = 1024, 20
         if splitter == "token":
@@ -336,13 +351,6 @@ async def vectorize_content_for_strategy(input: DocumentVectorizationInput) -> d
             n.metadata = getattr(n, "metadata", None) or {}
             n.metadata["strategy"] = strategy_id
             n.metadata.setdefault("source_doc", getattr(n, "ref_doc_id", "") or doc_id)
-    else:
-        doc = Document(text=text, id_=doc_id)
-        parser = LLMNodeParser(
-            strategy_id=strategy_id,
-            strategy_instruction=sd.get("instruction", ""),
-        )
-        nodes = parser.get_nodes_from_documents([doc])
 
     if not nodes:
         return {"status": "skipped", "rows": 0}
@@ -357,10 +365,11 @@ async def vectorize_content_for_strategy(input: DocumentVectorizationInput) -> d
             flush=True,
         )
 
+    ensure_metadata_source_spans_for_nodes(text, nodes)
+
     append_chunk_cache(strategy_id, input.content_hash, nodes)
 
     embed_model = Settings.embed_model
-    spans = char_spans_for_nodes(text, nodes)
     chunk_texts: list[str] = []
     for node in nodes:
         if hasattr(node, "get_content"):
@@ -374,20 +383,16 @@ async def vectorize_content_for_strategy(input: DocumentVectorizationInput) -> d
         embeddings = [embed_model.get_text_embedding(t) for t in chunk_texts]
 
     rows: list[dict[str, Any]] = []
-    for node, (span_start, span_end), emb, ct in zip(nodes, spans, embeddings, chunk_texts, strict=True):
+    for node, emb, ct in zip(nodes, embeddings, chunk_texts, strict=True):
         meta = dict(getattr(node, "metadata", None) or {})
-        row: dict[str, Any] = {
-            "content_hash": input.content_hash,
-            "span_start": int(span_start),
-            "span_end": int(span_end),
-            "embedding": list(emb),
-            "metadata": meta,
-            "chunk_text": ct,
-        }
-        sr = meta.get("span_ranges")
-        if isinstance(sr, list) and sr:
-            row["span_ranges"] = sr
-        rows.append(row)
+        rows.append(
+            {
+                "content_hash": input.content_hash,
+                "embedding": list(emb),
+                "metadata": meta,
+                "chunk_text": ct,
+            }
+        )
 
     vs.upsert_rows(
         strategy_fingerprint=input.strategy_fingerprint,
