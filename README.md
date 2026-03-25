@@ -86,7 +86,8 @@ python scripts/start_strategy_chunking.py s_default
   - The **source document** and the **strategy id** (`strategy=<id>`) that produced that chunk.
 
 ### Quick demo
-![rechunk_quick_demo](https://github.com/user-attachments/assets/fb8d6dc5-f3f2-46a3-a58a-a053c70c9730)
+![getting_started_rechunk](https://github.com/user-attachments/assets/1af15911-7926-4d39-b90e-c8a72003b54e)
+
 
 ### System diagrams
 
