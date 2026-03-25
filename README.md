@@ -20,6 +20,8 @@ Built on [LlamaIndex](https://www.llamaindex.ai/) and [Temporal](https://tempora
 
 Optional **local** docs (not tracked in git): `rechunk_strategy.md` (design / roadmap), `REPOSITORY_DESCRIPTION.md` (GitHub *About* blurb), `TEMPORAL_IMPLEMENTATION_STEPS.md` (implementation checklist).
 
+**Tracked design note — derived chunks (planned):** **[DERIVED_CHUNKS.md](DERIVED_CHUNKS.md)** describes the upcoming `derived` strategy kind (synthetic embeddable text + `source_spans`), dedup keys, persistence, and a **prominent “Future revisions”** section for how we might evolve the design.
+
 ## Install
 
 ```bash
@@ -60,7 +62,7 @@ python scripts/prepare_hf_benchmark_corpus.py cuad --n 40
 python scripts/prepare_hf_benchmark_corpus.py pg19 --n 15 --split validation  # streams until n books; add --full-split to download whole split
 ```
 
-Defaults write under `storage/benchmark_corpora/<preset>/`. See **`scripts/BENCHMARK_CORPORA.md`** for flags and ingest commands.
+Defaults write under `docs/benchmark_corpora/<preset>/`. See **`scripts/BENCHMARK_CORPORA.md`** for flags and ingest commands.
 
 ### Temporal (ingest vs vectorization)
 

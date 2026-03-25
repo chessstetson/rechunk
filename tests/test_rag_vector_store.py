@@ -23,18 +23,22 @@ def test_build_index_from_vector_rows_roundtrip(tmp_path) -> None:
     rows = [
         {
             "content_hash": h,
-            "span_start": 0,
-            "span_end": 5,
             "embedding": [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            "metadata": {"strategy": "s_test", "source_doc": "doc1.txt"},
+            "metadata": {
+                "strategy": "s_test",
+                "source_doc": "doc1.txt",
+                "source_spans": [{"start_char": 0, "end_char": 5}],
+            },
             "chunk_text": "hello",
         },
         {
             "content_hash": h,
-            "span_start": 6,
-            "span_end": 11,
             "embedding": [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            "metadata": {"strategy": "s_test", "source_doc": "doc1.txt"},
+            "metadata": {
+                "strategy": "s_test",
+                "source_doc": "doc1.txt",
+                "source_spans": [{"start_char": 6, "end_char": 11}],
+            },
             "chunk_text": "world",
         },
     ]

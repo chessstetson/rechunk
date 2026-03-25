@@ -86,13 +86,20 @@ def build_strategy_from_cli(
     splitter: str = "sentence",
     model: str | None = None,
 ) -> Strategy:
-    """Construct a :class:`Strategy` from CLI flags (``kind`` is ``llm`` or ``builtin_splitter``)."""
+    """Construct a :class:`Strategy` from CLI flags (``llm`` | ``derived`` | ``builtin_splitter``)."""
     if kind == "builtin_splitter":
         return Strategy(
             id=strategy_id,
             kind="builtin_splitter",
             instruction=instruction,
             splitter=splitter,
+        )
+    if kind == "derived":
+        return Strategy(
+            id=strategy_id,
+            kind="derived",
+            instruction=instruction,
+            model=model,
         )
     return Strategy(
         id=strategy_id,

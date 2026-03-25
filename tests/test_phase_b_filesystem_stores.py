@@ -123,10 +123,9 @@ def test_vector_store_upsert_and_list(vs: FilesystemVectorStore) -> None:
         rows=[
             {
                 "content_hash": h,
-                "span_start": 0,
-                "span_end": 5,
                 "embedding": [0.1, 0.2],
-                "metadata": {"k": 1},
+                "metadata": {"k": 1, "source_spans": [{"start_char": 0, "end_char": 5}]},
+                "chunk_text": "hello",
             }
         ],
     )
@@ -142,7 +141,7 @@ def test_vector_store_upsert_and_list(vs: FilesystemVectorStore) -> None:
         vector_schema_version=schema,
     )
     assert len(rows) == 1
-    assert rows[0]["span_end"] == 5
+    assert rows[0]["metadata"]["source_spans"] == [{"start_char": 0, "end_char": 5}]
 
 
 def test_vector_store_upsert_replaces_same_span(vs: FilesystemVectorStore) -> None:
@@ -154,14 +153,15 @@ def test_vector_store_upsert_replaces_same_span(vs: FilesystemVectorStore) -> No
         embedding_fingerprint=efp,
         vector_schema_version="v1",
     )
-    vs.upsert_rows(
-        rows=[{"content_hash": h, "span_start": 0, "span_end": 3, "embedding": [1.0]}],
-        **base,
-    )
-    vs.upsert_rows(
-        rows=[{"content_hash": h, "span_start": 0, "span_end": 3, "embedding": [2.0]}],
-        **base,
-    )
+    row_shape = {
+        "content_hash": h,
+        "embedding": [1.0],
+        "metadata": {"source_spans": [{"start_char": 0, "end_char": 3}]},
+        "chunk_text": "abc",
+    }
+    vs.upsert_rows(rows=[dict(row_shape)], **base)
+    row_shape["embedding"] = [2.0]
+    vs.upsert_rows(rows=[dict(row_shape)], **base)
     rows = vs.read_rows_for_hash(content_hash=h, **base)
     assert rows[0]["embedding"] == [2.0]
 

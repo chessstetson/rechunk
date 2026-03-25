@@ -16,6 +16,13 @@ from llama_index.core.llms import LLM
 from llama_index.core.node_parser import NodeParser
 from llama_index.core.schema import BaseNode, MetadataMode, TextNode
 
+from rechunk.derived_metadata import build_sorted_source_spans_metadata
+
+
+def _metadata_source_spans_from_pairs(pairs: list[tuple[int, int]]) -> list[dict[str, int]]:
+    return [{"start_char": int(s), "end_char": int(e)} for s, e in sorted(pairs, key=lambda t: (t[0], t[1]))]
+
+
 # Conservative limit so prompt + document stay under typical 16k context (~4 chars/token).
 # Override via LLMNodeParser(max_doc_chars_for_llm=...) if using a larger context model.
 DEFAULT_MAX_DOC_CHARS_FOR_LLM = 50_000
@@ -163,11 +170,13 @@ def _windowed_fallback(
         node = TextNode(
             id_=fallback_id,
             text=chunk_text,
-            metadata={"strategy": strategy_id, "source_doc": doc_id},
+            metadata={
+                "strategy": strategy_id,
+                "source_doc": doc_id,
+                "source_spans": [{"start_char": start, "end_char": end}],
+            },
             ref_doc_id=doc_id,
         )
-        node.start_char_idx = start
-        node.end_char_idx = end
         out.append(node)
         if end >= len(text_str):
             break
@@ -278,29 +287,17 @@ class LLMNodeParser(NodeParser):
                         # Trust span positions if content drifts (whitespace / model slip)
                         if content.strip() != reconstructed.strip():
                             content = reconstructed
-                        meta["span_ranges"] = [[int(s), int(e)] for s, e in span_list]
-                        bbox_lo = min(s for s, _ in span_list)
-                        bbox_hi = max(e for _, e in span_list)
-                        start_char_idx, end_char_idx = bbox_lo, bbox_hi
+                        meta["source_spans"] = _metadata_source_spans_from_pairs(span_list)
                     else:
-                        start_char_idx = c.get("start_char")
-                        end_char_idx = c.get("end_char")
-                        if start_char_idx is not None and end_char_idx is not None:
+                        sc = c.get("start_char")
+                        ec = c.get("end_char")
+                        if sc is not None and ec is not None:
                             try:
-                                start_char_idx = int(start_char_idx)
-                                end_char_idx = int(end_char_idx)
-                                if (
-                                    start_char_idx < 0
-                                    or end_char_idx > doc_len
-                                    or start_char_idx >= end_char_idx
-                                ):
-                                    start_char_idx = end_char_idx = None
+                                sci, eci = int(sc), int(ec)
+                                if 0 <= sci < eci <= doc_len:
+                                    meta["source_spans"] = _metadata_source_spans_from_pairs([(sci, eci)])
                             except (TypeError, ValueError):
-                                start_char_idx = end_char_idx = None
-                        else:
-                            start_char_idx = end_char_idx = None
-                        if start_char_idx is not None and end_char_idx is not None:
-                            meta["span_ranges"] = [[start_char_idx, end_char_idx]]
+                                pass
 
                     temp_node = TextNode(text=content)
                     chunk_id = c.get("chunk_id") or self.id_func(temp_node)
@@ -310,9 +307,6 @@ class LLMNodeParser(NodeParser):
                         metadata=meta,
                         ref_doc_id=doc_id,
                     )
-                    if start_char_idx is not None and end_char_idx is not None:
-                        new_node.start_char_idx = start_char_idx
-                        new_node.end_char_idx = end_char_idx
                     out.append(new_node)
             except Exception as e:
                 # If an individual document fails (timeout, API error, context_length_exceeded, etc.),
@@ -328,6 +322,189 @@ class LLMNodeParser(NodeParser):
                         doc_id,
                         self.strategy_id,
                         id_prefix="error_fallback",
+                    )
+                )
+        return out
+
+
+DERIVED_CHUNKING_PROMPT = """You are a document analysis engine. Given the document below, apply the strategy
+and return a JSON array of **derived nodes**.
+
+Strategy: {strategy_instruction}
+
+Rules:
+- Each node has **freely written** ``content`` (synthetic text optimized for retrieval — summaries, inventories, profiles, etc.). It does **not** need to be a verbatim substring of the document.
+- Every node **must** include ``source_spans``: a non-empty list of regions in the document this node is grounded in. Each element: ``{{"start_char": i, "end_char": j}}`` with 0-based indices and **exclusive** ``end_char``. You may add an optional short ``quote`` (≤120 chars, verbatim from the document within that span) to anchor the UI.
+- Order of ``source_spans`` does not matter for identity; cite every region the node depends on.
+- Return ONLY valid JSON. No preamble, no explanation.
+
+Response format:
+[
+  {{
+    "node_id": "unique string",
+    "content": "generated analysis text — not necessarily verbatim from the document",
+    "source_spans": [
+      {{"start_char": 0, "end_char": 200, "quote": "optional short verbatim anchor"}},
+      {{"start_char": 500, "end_char": 620}}
+    ],
+    "metadata": {{ "strategy": "{strategy_id}", "source_doc": "{doc_id}" }}
+  }}
+]
+
+Document:
+{document_text}
+"""
+
+
+class DerivedNodeParser(NodeParser):
+    """
+    LLM produces **derived** text plus ``source_spans`` for provenance (see ``DERIVED_CHUNKS.md``).
+
+    Same length pre-check and windowed fallback as :class:`LLMNodeParser` when the document is too
+    long for one model call (fallback is **not** derived-quality; it is overlapping windows).
+    """
+
+    strategy_id: str
+    strategy_instruction: str
+    llm: Optional[LLM] = None
+    max_doc_chars_for_llm: int = DEFAULT_MAX_DOC_CHARS_FOR_LLM
+
+    def _parse_nodes(
+        self,
+        nodes: Sequence[BaseNode],
+        show_progress: bool = False,
+        **kwargs: Any,
+    ) -> List[BaseNode]:
+        import sys
+        from llama_index.core.utils import get_tqdm_iterable
+
+        out: List[BaseNode] = []
+        node_list = list(nodes)
+        total = len(node_list)
+        items = get_tqdm_iterable(node_list, show_progress, "ReChunk (derived)")
+        for i, node in enumerate(items):
+            doc_id = getattr(node, "id_", None) or getattr(node, "node_id", None) or ""
+            print(f"      [{i + 1}/{total}] derived {doc_id}", file=sys.stderr, flush=True)
+            if hasattr(node, "text"):
+                text = node.text
+            else:
+                text = node.get_content(metadata_mode=MetadataMode.NONE)
+            if not text.strip():
+                continue
+            if len(text) > self.max_doc_chars_for_llm:
+                print(
+                    f"      [SKIP] Doc over {self.max_doc_chars_for_llm} chars ({doc_id!r}). "
+                    "Using semi-overlapping window fallback (not derived-quality).",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                out.extend(
+                    _windowed_fallback(
+                        text,
+                        doc_id,
+                        self.strategy_id,
+                        id_prefix="length_fallback_derived",
+                    )
+                )
+                continue
+            try:
+                prompt = DERIVED_CHUNKING_PROMPT.format(
+                    strategy_instruction=self.strategy_instruction,
+                    strategy_id=self.strategy_id,
+                    doc_id=doc_id,
+                    document_text=text,
+                )
+                llm = self.llm
+                if llm is None:
+                    from llama_index.core import Settings
+
+                    llm = Settings.llm
+                response = llm.complete(prompt)
+                raw = str(response).strip()
+                try:
+                    chunks = _extract_json_array(raw)
+                except (json.JSONDecodeError, TypeError):
+                    chunks = [
+                        {
+                            "node_id": f"{doc_id}_fallback",
+                            "content": text[:8000] + ("…" if len(text) > 8000 else ""),
+                            "source_spans": [{"start_char": 0, "end_char": len(text)}],
+                            "metadata": {"strategy": self.strategy_id, "source_doc": doc_id},
+                        }
+                    ]
+                doc_len = len(text)
+                seen_keys: set[tuple[tuple[int, int], ...]] = set()
+                for c in chunks:
+                    meta = dict(c.get("metadata") or {})
+                    meta.setdefault("strategy", self.strategy_id)
+                    meta.setdefault("source_doc", doc_id)
+                    meta["derived"] = True
+
+                    raw_spans = c.get("source_spans")
+                    if not isinstance(raw_spans, list):
+                        print(
+                            f"      [WARN] derived node missing source_spans; skipping ({doc_id!r})",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        continue
+                    stored_spans = build_sorted_source_spans_metadata(raw_spans, doc_len=doc_len)
+                    if not stored_spans:
+                        print(
+                            f"      [WARN] derived node invalid source_spans; skipping ({doc_id!r})",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        continue
+
+                    pair_key = tuple(
+                        (int(d["start_char"]), int(d["end_char"])) for d in stored_spans
+                    )
+                    if pair_key in seen_keys:
+                        print(
+                            f"      [WARN] duplicate derived canonical span key {pair_key!r}; "
+                            f"keeping one node ({doc_id!r})",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        continue
+                    seen_keys.add(pair_key)
+
+                    content = c.get("content", "")
+                    if not isinstance(content, str):
+                        content = str(content or "")
+                    if not content.strip():
+                        print(
+                            f"      [WARN] derived node empty content; skipping ({doc_id!r})",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        continue
+
+                    meta["source_spans"] = stored_spans
+
+                    nid = c.get("node_id") or c.get("chunk_id")
+                    temp_node = TextNode(text=content)
+                    chunk_id = nid or self.id_func(temp_node)
+                    new_node = TextNode(
+                        id_=str(chunk_id),
+                        text=content,
+                        metadata=meta,
+                        ref_doc_id=doc_id,
+                    )
+                    out.append(new_node)
+            except Exception as e:
+                print(
+                    f"      [SKIP] Derived parse failed for {doc_id!r}: {e}. Window fallback.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                out.extend(
+                    _windowed_fallback(
+                        text,
+                        doc_id,
+                        self.strategy_id,
+                        id_prefix="error_fallback_derived",
                     )
                 )
         return out

@@ -2,7 +2,11 @@
 """
 Start **one** :class:`BatchDocumentVectorizationWorkflow` for all pending ECS hashes (single strategy).
 
-Each hash is processed as its own **activity** inside that workflow (sequential, easy to follow in UI).
+Each hash is its own **activity**; the workflow runs them in **waves** of parallel
+``asyncio.gather`` (size from ``RECHUNK_BATCH_VECTORIZATION_FANOUT``, default 32) so workflow
+tasks do not time out. Within a wave, ``max_concurrent_activities`` on the worker caps concurrency.
+
+Set ``RECHUNK_BATCH_WORKFLOW_TASK_TIMEOUT_SECONDS`` if workflow tasks still time out (default 600s).
 
 Uses **ECS active hashes** vs **VectorStore** row presence only — no corpus path argument.
 Run ``scripts/start_corpus_ingest.py <docs_root>`` first so ECS is populated.
@@ -42,7 +46,11 @@ from rechunk.index_service import (
 from rechunk.strategies import DEFAULT_BASELINE_STRATEGY, Strategy, strategy_to_dict
 from rechunk.temporal_queues import TASK_QUEUE_VECTORIZATION
 from rechunk.vector_store import FilesystemVectorStore
-from rechunk.vectorization_config import VECTOR_SCHEMA_VERSION
+from rechunk.vectorization_config import (
+    VECTOR_SCHEMA_VERSION,
+    batch_vectorization_fanout_batch_size,
+    batch_vectorization_workflow_task_timeout,
+)
 from temporal_vectorization_inputs import BatchDocumentVectorizationInput
 from temporal_workflows import BatchDocumentVectorizationWorkflow
 
@@ -61,10 +69,10 @@ async def main() -> None:
     parser.add_argument("strategy_id", help="Strategy ID (e.g. s_entities or s_default)")
     parser.add_argument(
         "--kind",
-        choices=("llm", "builtin"),
+        choices=("llm", "builtin", "derived"),
         default="builtin",
         help=(
-            "Fallback if strategy_id is missing from rechunk_strategies.json: llm or builtin. "
+            "Fallback if strategy_id is missing from rechunk_strategies.json: llm, derived, or builtin. "
             "If the id exists in the file, that file entry is used (see printed kind below)."
         ),
     )
@@ -106,11 +114,14 @@ async def main() -> None:
         strategy_id=args.strategy_id,
         cli_strategy=cli_strategy,
     )
-    chunking_mode = (
-        "LLM chunking (slow: one strategy call per doc)"
-        if strategy.kind == "llm"
-        else f"built-in splitter ({getattr(strategy, 'splitter', 'sentence')!r}, no chunking LLM)"
-    )
+    if strategy.kind == "derived":
+        chunking_mode = "derived nodes (LLM synthetic text + source_spans; slow)"
+    elif strategy.kind == "llm":
+        chunking_mode = "LLM verbatim chunking (slow: one strategy call per doc)"
+    else:
+        chunking_mode = (
+            f"built-in splitter ({getattr(strategy, 'splitter', 'sentence')!r}, no chunking LLM)"
+        )
     print(
         f"Resolved strategy {strategy.id!r}: kind={strategy.kind!r} → {chunking_mode}.",
         flush=True,
@@ -168,6 +179,7 @@ async def main() -> None:
         strategy_fingerprint=sfp,
         embedding_fingerprint=efp,
         vector_schema_version=VECTOR_SCHEMA_VERSION,
+        fanout_batch_size=batch_vectorization_fanout_batch_size(),
     )
     wid = f"rechunk-batch-v12-{strategy.id}-{uuid.uuid4().hex[:12]}"
 
@@ -185,6 +197,7 @@ async def main() -> None:
         id=wid,
         task_queue=TASK_QUEUE_VECTORIZATION,
         id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+        task_timeout=batch_vectorization_workflow_task_timeout(),
     )
 
     print(

@@ -6,7 +6,7 @@ Filesystem-backed :class:`VectorStore` for local dev (v12 Phase B).
     rows/{strategy_fingerprint}/{embedding_fingerprint}/{vector_schema_version}/{content_hash}.json
 
 Each file holds a JSON object ``{"rows": [ {...}, ... ]}`` where each row includes at least
-``content_hash``, ``span_start``, ``span_end``, and ``embedding`` (list of floats).
+``content_hash``, ``embedding``, ``chunk_text``, ``metadata`` (with ``source_spans`` provenance).
 
 **Collections** (materialized LlamaIndex persist layout)::
 
@@ -29,6 +29,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from rechunk.derived_metadata import canonical_source_spans_merge_key
 from rechunk.repo_paths import project_root
 
 
@@ -190,28 +191,29 @@ class FilesystemVectorStore:
                 existing = list(data.get("rows", []))
 
             def row_merge_key(r: dict[str, Any]) -> tuple:
-                """
-                Single-region rows: (0, span_start, span_end).
-                Multi-region (``span_ranges`` with 2+ segments): (1, tuple of pairs) so bbox
-                collisions cannot merge different chunks.
-                """
-                sr = r.get("span_ranges")
-                if isinstance(sr, list) and len(sr) > 1:
-                    pairs: list[tuple[int, int]] = []
-                    for x in sr:
-                        if isinstance(x, (list, tuple)) and len(x) == 2:
-                            pairs.append((int(x[0]), int(x[1])))
-                    if len(pairs) > 1:
-                        return (1, tuple(pairs))
-                if "span_start" not in r or "span_end" not in r:
-                    raise ValueError("each row must include span_start and span_end")
-                return (0, int(r["span_start"]), int(r["span_end"]))
+                """Sorted ``(start, end)`` tuple from ``metadata['source_spans']``."""
+                meta = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+                ck = canonical_source_spans_merge_key(meta)
+                if ck is None:
+                    raise ValueError("each row metadata must include valid source_spans")
+                return ck
 
             merged = {row_merge_key(r): r for r in existing}
             for r in new_rows:
-                if "span_start" not in r or "span_end" not in r:
-                    raise ValueError("each row must include span_start and span_end")
-                merged[row_merge_key(r)] = r
+                k = row_merge_key(r)
+                if k in merged:
+                    old_ct = merged[k].get("chunk_text", "")
+                    new_ct = r.get("chunk_text", "")
+                    if old_ct != new_ct:
+                        import sys
+
+                        print(
+                            f"  [WARN] vector_store upsert: replacing row merge_key={k!r} "
+                            f"(chunk_text changed, len {len(old_ct)} → {len(new_ct)})",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                merged[k] = r
 
             payload = json.dumps(
                 {"rows": [merged[k] for k in sorted(merged.keys())]},

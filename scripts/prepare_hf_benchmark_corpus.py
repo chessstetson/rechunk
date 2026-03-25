@@ -10,18 +10,21 @@ Install deps (once)::
 ``benchmark-corpora`` pins ``datasets<4`` (4.x removed **loading scripts**; ``deepmind/pg19`` still uses one).
 It also includes ``pdfplumber`` for CUAD Pdf columns when needed.
 
-Examples::
+Examples (defaults write under ``docs/benchmark_corpora/<preset>/``)::
+
+    python scripts/prepare_hf_benchmark_corpus.py wikipedia --n 300
+    python scripts/prepare_hf_benchmark_corpus.py cuad --n 40
+    python scripts/prepare_hf_benchmark_corpus.py pg19 --n 15 --split validation
+
+Override output root::
 
     python scripts/prepare_hf_benchmark_corpus.py wikipedia --out storage/benchmark_corpora/wikipedia --n 300
-    python scripts/prepare_hf_benchmark_corpus.py cuad --out storage/benchmark_corpora/cuad --n 40
-    python scripts/prepare_hf_benchmark_corpus.py pg19 --out storage/benchmark_corpora/pg19 --n 15 --split validation
 
 Then ingest (with Temporal worker running)::
 
-    python scripts/start_corpus_ingest.py storage/benchmark_corpora/wikipedia --wait
+    python scripts/start_corpus_ingest.py docs/benchmark_corpora/wikipedia --wait
 
-**Note:** ``docs/`` and ``storage/`` are gitignored in this repo; use ``storage/benchmark_corpora/...``
-or any path you prefer.
+**Note:** ``docs/`` and ``storage/`` are gitignored in this repo; pick any ``--out`` you prefer.
 """
 
 from __future__ import annotations
@@ -656,7 +659,7 @@ def main() -> int:
         p.add_argument(
             "--out",
             type=Path,
-            help="Output directory (default: storage/benchmark_corpora/<preset> under repo root)",
+            help="Output directory (default: docs/benchmark_corpora/<preset> under repo root)",
         )
         p.add_argument(
             "--n",
@@ -746,7 +749,7 @@ def main() -> int:
     args = parser.parse_args()
     repo_root = Path(__file__).resolve().parents[1]
     if args.out is None:
-        args.out = repo_root / "storage" / "benchmark_corpora" / str(args.preset)
+        args.out = repo_root / "docs" / "benchmark_corpora" / str(args.preset)
     load_dataset = _require_datasets()
     return int(args.func(args, load_dataset))
 

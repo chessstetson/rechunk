@@ -52,6 +52,7 @@ from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.llms.openai import OpenAI
 
 from rechunk.cache import cache_updated_since, get_strategy_cache_mtimes
+from rechunk.derived_metadata import bbox_from_source_spans
 from rechunk.corpus import ContentRef
 from rechunk.corpus_manager import (
     EcsActiveCorpusManager,
@@ -350,18 +351,24 @@ def manage_strategies_interactively(
     while True:
         print("\nCurrent strategies:")
         for i, s in enumerate(strategies, 1):
-            extra = f"  splitter={s.splitter}" if s.kind == "builtin_splitter" else ""
-            if s.kind == "llm":
+            if s.kind == "builtin_splitter":
+                extra = f"  splitter={s.splitter}"
+            elif s.kind == "llm":
                 extra = f"  model={getattr(s, 'model', None) or 'gpt-4o-mini'}"
+            elif s.kind == "derived":
+                extra = f"  model={getattr(s, 'model', None) or 'gpt-4o-mini'}  (synthetic + source_spans)"
+            else:
+                extra = ""
             print(f"  [{i}] {s.id}  (type={s.kind}{extra})  instruction={s.instruction!r}")
         print(
             "\nStrategy menu:\n"
-            "  [a] Add new LLM strategy\n"
+            "  [a] Add new LLM strategy (verbatim / multi-span extraction)\n"
+            "  [c] Add derived strategy (LLM synthetic text + source_spans)\n"
             "  [b] Add built-in splitter (Sentence or Token)\n"
             "  [d] Delete a strategy\n"
             "  [x] Back (no more changes)\n"
         )
-        choice = input("Choice [a/b/d/x]: ").strip().lower()
+        choice = input("Choice [a/b/c/d/x]: ").strip().lower()
         if choice in ("x", "", "q", "exit"):
             break
         if choice == "a":
@@ -378,6 +385,33 @@ def manage_strategies_interactively(
             strategies.append(Strategy(id=sid, kind="llm", instruction=instr, model=model))
             save_strategies(strategies_path, strategies)
             print(f"Added LLM strategy {sid!r} (model={model or 'gpt-4o-mini'}). Saved to {strategies_path.name}")
+            _enqueue_vectorization_after_new_strategy(
+                strategies[-1],
+                strategies_path=strategies_path,
+                docs_root=docs_root,
+                doc_ids=doc_ids,
+                enqueue_ecs_vectorization=enqueue_ecs_vectorization,
+                temporal_address=temporal_address,
+            )
+        elif choice == "c":
+            sid = input("New derived strategy id (e.g. s_doc_summary): ").strip()
+            if not sid:
+                print("No id entered; skipping.")
+                continue
+            instr = input(
+                "Instruction (what derived nodes to produce; each needs source_spans in the doc): "
+            ).strip()
+            if not instr:
+                print("No instruction entered; skipping.")
+                continue
+            model_input = input("Model (default gpt-4o-mini, or e.g. gpt-4o): ").strip()
+            model = model_input if model_input else None
+            strategies.append(Strategy(id=sid, kind="derived", instruction=instr, model=model))
+            save_strategies(strategies_path, strategies)
+            print(
+                f"Added derived strategy {sid!r} (model={model or 'gpt-4o-mini'}). "
+                f"Saved to {strategies_path.name}"
+            )
             _enqueue_vectorization_after_new_strategy(
                 strategies[-1],
                 strategies_path=strategies_path,
@@ -467,12 +501,32 @@ def run_query_with_feedback(
         meta = getattr(node, "metadata", None) or {}
         source = getattr(node, "ref_doc_id", None) or meta.get("source_doc", "?")
         strategy = meta.get("strategy", "?")
-        start = getattr(node, "start_char_idx", None)
-        end = getattr(node, "end_char_idx", None)
+        start, end = None, None
+        ss = meta.get("source_spans")
+        doc_len_guess = 1
+        if isinstance(ss, list):
+            for x in ss:
+                if isinstance(x, dict) and x.get("end_char") is not None:
+                    try:
+                        doc_len_guess = max(doc_len_guess, int(x["end_char"]))
+                    except (TypeError, ValueError):
+                        pass
+        bb = bbox_from_source_spans(meta, doc_len=doc_len_guess)
+        if bb is not None:
+            start, end = bb
+        prov = ""
+        if isinstance(ss, list) and ss:
+            bits = []
+            for x in ss[:4]:
+                if isinstance(x, dict):
+                    bits.append(f"{x.get('start_char')}–{x.get('end_char')}")
+            if bits:
+                more = f" (+{len(ss) - len(bits)} more)" if len(ss) > len(bits) else ""
+                prov = f"  source_spans={bits}{more}"
         if start is not None and end is not None:
-            loc = f"  source={source!r}  strategy={strategy}  chars {start}–{end}"
+            loc = f"  source={source!r}  strategy={strategy}  chars {start}–{end}{prov}"
         else:
-            loc = f"  source={source!r}  strategy={strategy}  (position in doc not stored)"
+            loc = f"  source={source!r}  strategy={strategy}  (no char bbox on node){prov}"
         print(f"    {i}.{score_str}{loc}")
         print(f"       {preview!r}")
     print()

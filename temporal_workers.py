@@ -52,6 +52,23 @@ from temporal_workflows import (
 )
 
 
+def _max_concurrent_activities() -> int:
+    """
+    Cap simultaneous activity executions per vectorization worker process.
+
+    OpenAI / disk-heavy vectorization benefits from >1 but not unbounded parallelism.
+    Set ``RECHUNK_MAX_CONCURRENT_ACTIVITIES`` (integer). When unset or invalid, defaults to ``8``.
+    """
+    raw = os.environ.get("RECHUNK_MAX_CONCURRENT_ACTIVITIES", "").strip()
+    if not raw:
+        return 8
+    try:
+        n = int(raw, 10)
+    except ValueError:
+        return 8
+    return max(1, n)
+
+
 def _roles_from_argv_and_env() -> set[str]:
     env = os.environ.get("RECHUNK_TEMPORAL_WORKER_ROLE", "").strip().lower()
     if env in ("ingest", "vectorization", "both"):
@@ -87,6 +104,12 @@ async def _run_vectorization_worker(client: Client) -> None:
     vs = FilesystemVectorStore(embed_model=Settings.embed_model)
     configure_worker_runtime(ecs, vs)
 
+    max_act = _max_concurrent_activities()
+    print(
+        f"  max_concurrent_activities={max_act} (override with RECHUNK_MAX_CONCURRENT_ACTIVITIES)",
+        file=sys.stderr,
+        flush=True,
+    )
     worker = Worker(
         client,
         task_queue=TASK_QUEUE_VECTORIZATION,
@@ -105,6 +128,7 @@ async def _run_vectorization_worker(client: Client) -> None:
             log_workflow_summary,
             merge_active_corpus_manifest,
         ],
+        max_concurrent_activities=max_act,
     )
     await worker.run()
 

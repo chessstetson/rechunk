@@ -22,7 +22,7 @@ The extras also include **`pdfplumber`** for **CUAD** when Pdf columns are decod
 
 ## Export
 
-Each subcommand writes **only `.txt`** files under `--out` (default: `storage/benchmark_corpora/<preset>/`).  
+Each subcommand writes **only `.txt`** files under `--out` (default: `docs/benchmark_corpora/<preset>/`).  
 That layout matches what `scripts/start_corpus_ingest.py` expects (`.txt` under a single root).
 
 | Preset        | Hugging Face dataset        | Good for |
@@ -63,7 +63,7 @@ python scripts/prepare_hf_benchmark_corpus.py wikipedia --out ./docs_wiki_sample
 With `temporal server start-dev` and `python temporal_workers.py` running:
 
 ```bash
-python scripts/start_corpus_ingest.py storage/benchmark_corpora/wikipedia --wait
+python scripts/start_corpus_ingest.py docs/benchmark_corpora/wikipedia --wait
 python scripts/start_strategy_chunking.py s_default --wait
 python scripts/run_with_ecs.py --interactive
 ```
