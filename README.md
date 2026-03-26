@@ -18,9 +18,9 @@ Built on [LlamaIndex](https://www.llamaindex.ai/) and [Temporal](https://tempora
 - **Strategy layers** — built-in splitters (no LLM), **LLM** strategies (verbatim or multi-span excerpts), and **derived** strategies (synthetic `content` + required `source_spans`). Chunks are tagged by strategy for multi-layer retrieval (v0.2+).
 - **Feedback loop (roadmap)** — poor answers trigger diagnosis and, when the answer exists in the corpus, proposal of new strategies.
 
-Optional **local** docs (not tracked in git): `rechunk_strategy.md` (design / roadmap), `REPOSITORY_DESCRIPTION.md` (GitHub *About* blurb), `TEMPORAL_IMPLEMENTATION_STEPS.md` (implementation checklist).
+**Derived chunks (high level):** Some strategies use `kind: "derived"` in `rechunk_strategies.json`. The LLM writes **synthetic** chunk text (summaries, bullet lists, obligation-style notes, etc.) optimized for retrieval—not necessarily verbatim excerpts. Every chunk must carry **`source_spans`**: character ranges into the real document so the chunk stays **grounded** and auditable. Rows and caches treat `metadata["source_spans"]` as canonical provenance; see `src/rechunk/derived_metadata.py`, `DerivedNodeParser` in `node_parser.py`, and `tests/test_derived_*.py` for behavior.
 
-**Design note — derived chunks:** **[DERIVED_CHUNKS.md](DERIVED_CHUNKS.md)** documents the `derived` strategy kind (synthetic embeddable text + `source_spans`), dedup keys, persistence, and a **“Future revisions”** section for evolving the design.
+Optional **local** docs (not tracked in git): `rechunk_strategy.md` (design / roadmap), `REPOSITORY_DESCRIPTION.md` (GitHub *About* blurb), `TEMPORAL_IMPLEMENTATION_STEPS.md` (implementation checklist).
 
 For coding agents and integration details, see **[AGENTS.md](AGENTS.md)**.
 
@@ -102,9 +102,10 @@ python scripts/start_strategy_chunking.py s_default
 
 ### Strategy layers and union retrieval
 
-- Each **strategy** (built-in splitter or LLM-based) produces its own **layer of chunks**:
+- Each **strategy** (built-in splitter, LLM verbatim/multi-span, or **derived** synthetic + `source_spans`) produces its own **layer of chunks**:
   - Built-in: Sentence/Token splitters (no LLM) → chunks tagged with `metadata["strategy"] = "s_default"` / `"s_token"`, etc.
   - LLM: custom natural-language strategies → chunks tagged with their `strategy_id`.
+  - Derived: synthetic `content` + required `source_spans` → same tagging; see **Derived chunks** under *At a glance* above.
 - The index is built over the **union of all layers** (all chunks from all strategies).
 - At query time, retrieval runs over this union, and the retrieval log shows, for each top‑k hit:
   - The **source document** and the **strategy id** (`strategy=<id>`) that produced that chunk.

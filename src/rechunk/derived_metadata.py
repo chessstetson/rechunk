@@ -2,7 +2,7 @@
 ``source_spans`` provenance helpers (all strategy kinds).
 
 Parsing/sorting for LLM output, bbox for storage, and vector row merge keys.
-See ``DERIVED_CHUNKS.md`` for derived-specific semantics.
+Derived strategies (synthetic ``content`` + ``source_spans``) are summarized in **README.md**.
 """
 
 from __future__ import annotations

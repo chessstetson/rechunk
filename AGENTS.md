@@ -31,7 +31,7 @@ Workers: `python temporal_workers.py` (both queues) or `ingest` / `vectorization
 
 - **`builtin_splitter`** — LlamaIndex sentence/token windows; `splitter`: `"sentence"` \| `"token"`.
 - **`llm`** — LLM emits verbatim (or multi-span) chunks; provenance in **`metadata["source_spans"]`** (and related fields).
-- **`derived`** — LLM emits **synthetic** `content` + required **`source_spans`**; see `DERIVED_CHUNKS.md`.
+- **`derived`** — LLM emits **synthetic** `content` + required **`source_spans`**; overview in **README.md** (*Derived chunks*).
 
 Vector rows and JSONL caches use **`metadata["source_spans"]`** as the canonical provenance shape (sorted span keys for merge identity). See `src/rechunk/derived_metadata.py` and `src/rechunk/vector_store/filesystem.py`.
 
@@ -74,9 +74,8 @@ After touching chunking, vector rows, or workflows, run at least **`tests/test_p
 
 ## Docs for humans
 
-- **README.md** — quick start + architecture overview.
+- **README.md** — quick start + architecture overview (includes derived chunks summary).
 - **`scripts/BENCHMARK_CORPORA.md`** — Hugging Face export presets.
-- **`DERIVED_CHUNKS.md`** — derived strategy design + evolution notes.
 
 ## Pitfalls
 

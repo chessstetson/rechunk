@@ -358,7 +358,7 @@ Document:
 
 class DerivedNodeParser(NodeParser):
     """
-    LLM produces **derived** text plus ``source_spans`` for provenance (see ``DERIVED_CHUNKS.md``).
+    LLM produces **derived** text plus ``source_spans`` for provenance (see README, *Derived chunks*).
 
     Same length pre-check and windowed fallback as :class:`LLMNodeParser` when the document is too
     long for one model call (fallback is **not** derived-quality; it is overlapping windows).
