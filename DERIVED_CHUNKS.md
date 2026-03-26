@@ -1,6 +1,6 @@
-# Derived chunks — planned strategy
+# Derived chunks — strategy design
 
-**Status:** Design / roadmap. The `derived` strategy kind is **not** fully implemented in application code yet; this document keeps the approach coherent while implementation evolves (e.g. on branch `derivedchunks`).
+**Status:** The `derived` strategy kind is **implemented** in application code (`kind: "derived"` in `rechunk_strategies.json`). This document describes behavior, identity/dedup rules, and how we may revise the design later. Relevant modules: `src/rechunk/strategies.py`, `src/rechunk/derived_metadata.py`, `src/rechunk/node_parser.py`; tests: `tests/test_derived_metadata.py`, `tests/test_derived_node_parser.py`.
 
 ---
 
@@ -13,7 +13,7 @@ ReChunk today supports:
 | **`builtin_splitter`** | Mechanical sentence/token windows |
 | **`llm`** | Verbatim (or multi-span) excerpts from the source; `content` is built from document offsets |
 
-**`derived`** (planned) adds a third path: the LLM **writes synthetic text** optimized for embedding and retrieval (summaries, inventories, obligation profiles, timelines, etc.), while **`source_spans`** (and optional short `quote` anchors) tie that text back to **real regions of the source document**. The embedder still sees **plain string `content`** / `chunk_text`; nothing requires a second LLM pass to re-materialize that string — it is persisted like other chunks (JSONL + vector rows).
+**`derived`** adds a third path: the LLM **writes synthetic text** optimized for embedding and retrieval (summaries, inventories, obligation profiles, timelines, etc.), while **`source_spans`** (and optional short `quote` anchors) tie that text back to **real regions of the source document**. The embedder still sees **plain string `content`** / `chunk_text`; nothing requires a second LLM pass to re-materialize that string — it is persisted like other chunks (JSONL + vector rows).
 
 ---
 
