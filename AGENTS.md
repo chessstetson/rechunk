@@ -7,7 +7,7 @@ Short orientation for humans and coding agents working on **ReChunk**.
 - **RAG chunking** on top of **LlamaIndex**, with **Temporal** for durable ingest + vectorization.
 - **Corpus text** lives in **ECS** (`FilesystemExtractedContentService` → `storage/ecs/`).
 - **Embeddings + chunk rows** live in a **VectorStore** (dev default: `FilesystemVectorStore` → `storage/vector_store_dev/`).
-- **Strategies** (how to chunk) live in **`rechunk_strategies.json`** at the repo root (see `rechunk_strategies.json.example`).
+- **Strategies** (how to chunk) live in **`rechunk_strategies.json`** at the repo root (CLI can create defaults on first run).
 
 ## Layout
 

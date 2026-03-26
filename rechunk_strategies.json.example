@@ -1,9 +1,0 @@
-[
-  {
-    "id": "s_default",
-    "kind": "builtin_splitter",
-    "instruction": "Sentence-based splitting (LlamaIndex default, chunk_size=1024)",
-    "splitter": "sentence",
-    "model": null
-  }
-]

@@ -63,14 +63,10 @@ def check_rechunk_import() -> bool:
 
 def check_strategies_file() -> bool:
     p = _project_root / "rechunk_strategies.json"
-    ex = _project_root / "rechunk_strategies.json.example"
     if p.is_file():
         _ok(f"rechunk_strategies.json present ({p.name})")
         return True
-    if ex.is_file():
-        _warn(f"No rechunk_strategies.json — copy {ex.name} or run CLI to create defaults")
-    else:
-        _warn("No rechunk_strategies.json (CLI may create one on first run)")
+    _warn("No rechunk_strategies.json — run e.g. run_interactive / run_with_docs to create defaults")
     return False
 
 

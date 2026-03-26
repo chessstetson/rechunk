@@ -38,7 +38,7 @@ Requires Python 3.10+. Set `OPENAI_API_KEY` for embeddings, LLM chunking, and CL
 
 1. **Temporal** — install the [Temporal CLI](https://docs.temporal.io/cli) and start a dev server, e.g. `temporal server start-dev` (default address `localhost:7233`).
 2. **Install the package** — from the repo root: `pip install -e ".[dev]"` (or `pip install -e .` for runtime only).
-3. **Strategies file** — copy `rechunk_strategies.json.example` to `rechunk_strategies.json` at the repo root, or let the CLI create defaults on first use.
+3. **Strategies file** — optional: add `rechunk_strategies.json` at the repo root; otherwise the CLI creates a sensible default on first use.
 4. **API key** — `export OPENAI_API_KEY=...` in the shells where you run workers and interactive scripts.
 5. **Sanity check** — `python scripts/rechunk_doctor.py` (use `--strict` in CI if you want failure when Temporal is down or the key is missing).
 6. **Worker** — in one terminal: `python temporal_workers.py` (polls ingest + vectorization queues).
@@ -111,7 +111,7 @@ python scripts/start_strategy_chunking.py s_default
   - The **source document** and the **strategy id** (`strategy=<id>`) that produced that chunk.
 
 ### Quick demo
-![getting_started_rechunk](https://github.com/user-attachments/assets/1af15911-7926-4d39-b90e-c8a72003b54e)
+![Quick demo: ReChunk interactive run](rechunk_quick_demo.gif)
 
 
 ### System diagrams
