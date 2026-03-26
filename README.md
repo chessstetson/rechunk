@@ -15,27 +15,49 @@ Built on [LlamaIndex](https://www.llamaindex.ai/) and [Temporal](https://tempora
 ### At a glance
 
 - **Index = f(corpus, S)** — the index is a pure function of your documents and a set of chunking strategies.
-- **Strategy layers** — each strategy is a natural-language instruction; an LLM does the chunking. Chunks are tagged by strategy for multi-layer retrieval (v0.2+).
+- **Strategy layers** — built-in splitters (no LLM), **LLM** strategies (verbatim or multi-span excerpts), and **derived** strategies (synthetic `content` + required `source_spans`). Chunks are tagged by strategy for multi-layer retrieval (v0.2+).
 - **Feedback loop (roadmap)** — poor answers trigger diagnosis and, when the answer exists in the corpus, proposal of new strategies.
 
 Optional **local** docs (not tracked in git): `rechunk_strategy.md` (design / roadmap), `REPOSITORY_DESCRIPTION.md` (GitHub *About* blurb), `TEMPORAL_IMPLEMENTATION_STEPS.md` (implementation checklist).
 
-**Tracked design note — derived chunks (planned):** **[DERIVED_CHUNKS.md](DERIVED_CHUNKS.md)** describes the upcoming `derived` strategy kind (synthetic embeddable text + `source_spans`), dedup keys, persistence, and a **prominent “Future revisions”** section for how we might evolve the design.
+**Design note — derived chunks:** **[DERIVED_CHUNKS.md](DERIVED_CHUNKS.md)** documents the `derived` strategy kind (synthetic embeddable text + `source_spans`), dedup keys, persistence, and a **“Future revisions”** section for evolving the design.
+
+For coding agents and integration details, see **[AGENTS.md](AGENTS.md)**.
 
 ## Install
 
 ```bash
 pip install -e .
+# optional: dev + test deps
+pip install -e ".[dev]"
 ```
 
-Requires Python 3.10+. Optional: set `OPENAI_API_KEY` (or configure another LLM via LlamaIndex `Settings.llm`).
+Requires Python 3.10+. Set `OPENAI_API_KEY` for embeddings, LLM chunking, and CLI Q&A (or configure another LLM via LlamaIndex `Settings.llm`).
+
+## Quick start (first run)
+
+1. **Temporal** — install the [Temporal CLI](https://docs.temporal.io/cli) and start a dev server, e.g. `temporal server start-dev` (default address `localhost:7233`).
+2. **Install the package** — from the repo root: `pip install -e ".[dev]"` (or `pip install -e .` for runtime only).
+3. **Strategies file** — copy `rechunk_strategies.json.example` to `rechunk_strategies.json` at the repo root, or let the CLI create defaults on first use.
+4. **API key** — `export OPENAI_API_KEY=...` in the shells where you run workers and interactive scripts.
+5. **Sanity check** — `python scripts/rechunk_doctor.py` (use `--strict` in CI if you want failure when Temporal is down or the key is missing).
+6. **Worker** — in one terminal: `python temporal_workers.py` (polls ingest + vectorization queues).
+7. **Ingest + query** — in another: `python scripts/run_interactive.py path/to/your/docs` (ingests into ECS, queues vectorization, then Q&A). Or run ingest + chunking explicitly (see **Temporal** below).
+
+**Common issues**
+
+- **Empty or stale index** — worker not running, or vectorization still in flight; wait for workflows or check Temporal UI. Ensure the same `RECHUNK_OPENAI_EMBEDDING_MODEL` (if set) is used for workers and CLI index build.
+- **Strategies file** — `rechunk_strategies.json` must exist and list the `strategy_id` you pass to chunking scripts; see the example file.
+
+Environment variables are summarized in **AGENTS.md**.
 
 ## Run with your own docs
 
 From the project root (with `OPENAI_API_KEY` set and the package installed, e.g. in a venv):
 
 ```bash
-# Interactive helper: prompts for a path if you omit it; ingests into ECS, queues embeddings (Temporal), then Q&A
+# Interactive helper: verifies Temporal + ReChunk workers first (prints steps if not); --skip-temporal-check to bypass
+# If you omit the path, press Enter (or type demo) for a small Wikipedia subset, or enter your own path
 python scripts/run_interactive.py
 python scripts/run_interactive.py path/to/your/docs
 
@@ -152,7 +174,7 @@ flowchart TD
         WFV["BatchDocumentVectorizationWorkflow"]
         ACT_V["vectorize_content_for_strategy\n(activity)"]
         CHUNK["chunk (LLM or builtin)\n+ embed (OpenAI)"]
-        VS_ROWS["VectorStore.upsert_rows\nspan_start · span_end · embedding"]
+        VS_ROWS["VectorStore.upsert_rows\nsource_spans · embedding · metadata"]
     end
 
     subgraph query ["③ Query"]

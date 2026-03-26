@@ -88,6 +88,39 @@ STRATEGIES_FILE = Path(__file__).resolve().parent.parent / "rechunk_strategies.j
 # Max characters of chunk text to show in retrieval feedback
 CHUNK_PREVIEW_LEN = 280
 
+# How often to poll disk while waiting for the first index (no [r] required).
+_INITIAL_LOAD_POLL_INTERVAL_SEC = 2.0
+
+
+def _initial_load_progress_line(
+    index_service: Any | None,
+    strategies: list[Strategy],
+    content_refs: Sequence[ContentRef],
+    *,
+    use_vector_store_rows: bool,
+) -> str:
+    """Short status line for first-time index wait (vector store path)."""
+    if not use_vector_store_rows or index_service is None:
+        return "  …waiting for strategy chunk cache files under storage/strategies/"
+    n_active = len(content_refs)
+    n_strat = len(strategies)
+    if n_active == 0:
+        return "  …no active corpus hashes in ECS yet; ingest documents first"
+    pending = index_service.list_pending_vectorization(strategies)
+    total_units = n_active * n_strat
+    done_units = max(0, total_units - len(pending))
+    if total_units <= 0:
+        pct = 0.0
+    else:
+        pct = 100.0 * min(done_units, total_units) / total_units
+    bar_w = 20
+    filled = int(bar_w * done_units / total_units) if total_units else 0
+    bar = "#" * filled + "." * (bar_w - filled)
+    return (
+        f"  Initial load [{bar}] {pct:.0f}%  (~{done_units}/{total_units} doc×strategy units embedded; "
+        f"{len(pending)} still pending)"
+    )
+
 
 def _print_vector_store_fingerprint_mismatch_hint(
     vector_store: Any,
@@ -166,22 +199,37 @@ def _wait_until_non_empty_index_or_quit(
     use_vector_store_rows: bool,
     vector_store: Any | None,
     embedding_fingerprint: str | None,
+    automatic_initial_poll: bool = False,
+    index_service: Any | None = None,
 ) -> tuple[VectorStoreIndex, list, dict[str, float]] | None:
     """
     While the pooled index has zero nodes, do not offer the normal question prompt.
 
-    Lets the user reload from cache (or picks up worker writes via mtime) until chunks
-    exist, or they quit. Returns None if the user exits early.
+    If ``automatic_initial_poll`` (empty/missing strategies file on first load), polls the
+    cache periodically and rebuilds when the worker writes — no ``[r]`` required.
+
+    Otherwise the user reloads with Enter/r until chunks exist, or quits with q.
+    Returns None if the user exits early.
     """
     strategy_ids = [s.id for s in strategies]
-    print(
-        "\nNo embedding chunks are indexed yet — retrieval cannot run.\n"
-        "Start the Temporal worker and wait for vectorization "
-        + ("(VectorStore rows)" if use_vector_store_rows else "(strategy JSONL cache)")
-        + ", then press Enter here to reload (or type r). "
-        "The cache is also checked automatically when it changes.\n"
-        "Quit with q when done."
-    )
+    if automatic_initial_poll:
+        print(
+            "\nNo embedding chunks are indexed yet — retrieval cannot run.\n"
+            "**First-time setup:** there was no valid `rechunk_strategies.json`; a default "
+            "strategy was written and vectorization should be running on the worker.\n"
+            "Waiting for the first index build (refreshing automatically every "
+            f"{_INITIAL_LOAD_POLL_INTERVAL_SEC:.0f}s). Press **Ctrl+C** to cancel.\n"
+            "After this completes, the normal Q&A loop uses **[r]** only when you want a manual reload."
+        )
+    else:
+        print(
+            "\nNo embedding chunks are indexed yet — retrieval cannot run.\n"
+            "Start the Temporal worker and wait for vectorization "
+            + ("(VectorStore rows)" if use_vector_store_rows else "(strategy JSONL cache)")
+            + ", then press Enter here to reload (or type r). "
+            "The cache is also checked automatically when it changes.\n"
+            "Quit with q when done."
+        )
     while len(nodes) == 0:
         cache_dirty = False
         if use_vector_store_rows and vector_store is not None and embedding_fingerprint is not None:
@@ -243,6 +291,23 @@ def _wait_until_non_empty_index_or_quit(
 
         if len(nodes) > 0:
             break
+
+        if automatic_initial_poll:
+            try:
+                print(
+                    _initial_load_progress_line(
+                        index_service,
+                        strategies,
+                        content_refs,
+                        use_vector_store_rows=use_vector_store_rows,
+                    ),
+                    flush=True,
+                )
+                time.sleep(_INITIAL_LOAD_POLL_INTERVAL_SEC)
+            except KeyboardInterrupt:
+                print("\nBye.")
+                return None
+            continue
 
         try:
             cmd = input("\n[Enter] or [r] reload from cache  |  [q] quit: ").strip().lower()
@@ -652,6 +717,7 @@ def main() -> None:
 
     vector_store: Any | None = None
     embedding_fp: str | None = None
+    index_svc: Any | None = None
     if use_vector_store_rows:
         from rechunk.extracted_content import FilesystemExtractedContentService
         from rechunk.index_service import IndexService
@@ -677,7 +743,9 @@ def main() -> None:
         print("Legacy index path: JSONL chunk caches under storage/strategies/.", flush=True)
 
     # Load saved strategies if present; otherwise use default baseline and cue worker.
-    strategies = load_strategies(STRATEGIES_FILE)
+    raw_strategies = load_strategies(STRATEGIES_FILE)
+    initial_empty_strategy_file = raw_strategies is None
+    strategies = raw_strategies
     if strategies is None:
         print()
         print("=" * 70)
@@ -714,21 +782,21 @@ def main() -> None:
                 Strategy(id=args.strategy_id, kind="llm", instruction=args.strategy),
             )
 
-    # Filesystem corpus + ECS/VectorStore path: queue batch vectorization for every strategy
-    # (pending hashes only). Previously only happened when no strategy file existed.
-    if (
-        use_vector_store_rows
-        and not manifest_mode
-        and not ecs_only_mode
-        and docs_root is not None
-    ):
-        temporal_addr = os.environ.get("TEMPORAL_ADDRESS")
-        for s in strategies:
-            trigger_pending_vectorization_sync(
-                s,
-                temporal_address=temporal_addr,
-                strategies_path=STRATEGIES_FILE,
-            )
+    # ECS + VectorStore: enqueue batch vectorization for pending hashes (every strategy).
+    # Filesystem corpus: as before. ECS-only (`--ecs`): also enqueue on first-time default
+    # strategy file so `run_with_docs --ecs --interactive` can wait without a manual script run.
+    if use_vector_store_rows and not manifest_mode:
+        should_enqueue = (not ecs_only_mode and docs_root is not None) or (
+            ecs_only_mode and initial_empty_strategy_file
+        )
+        if should_enqueue:
+            temporal_addr = os.environ.get("TEMPORAL_ADDRESS")
+            for s in strategies:
+                trigger_pending_vectorization_sync(
+                    s,
+                    temporal_address=temporal_addr,
+                    strategies_path=STRATEGIES_FILE,
+                )
 
     from rechunk.vector_store.freshness import get_vector_store_strategy_mtimes
 
@@ -787,6 +855,8 @@ def main() -> None:
                 use_vector_store_rows=use_vector_store_rows,
                 vector_store=vector_store,
                 embedding_fingerprint=embedding_fp,
+                automatic_initial_poll=initial_empty_strategy_file,
+                index_service=index_svc,
             )
             if waited is None:
                 return
@@ -795,6 +865,11 @@ def main() -> None:
             f"\n{len(nodes)} chunks formed from {len(strategies)} strategy(ies). "
             "Enter a question (or 'quit'/'q' to exit). Index is rebuilt automatically when the worker updates the cache."
         )
+        if initial_empty_strategy_file:
+            print(
+                'Initial index not yet complete — ask a question on the partial index, '
+                'or hit "r" to reload or "q" to quit.'
+            )
         while True:
             cache_dirty = False
             if use_vector_store_rows and vector_store is not None and embedding_fp is not None:
@@ -848,6 +923,8 @@ def main() -> None:
                         use_vector_store_rows=use_vector_store_rows,
                         vector_store=vector_store,
                         embedding_fingerprint=embedding_fp,
+                        automatic_initial_poll=False,
+                        index_service=index_svc,
                     )
                     if waited is None:
                         break
