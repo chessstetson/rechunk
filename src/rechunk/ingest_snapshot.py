@@ -2,7 +2,7 @@
 Temporal ingest snapshot: workflow carries a path to a JSON file, not doc lists in history.
 
 The snapshot is written on the same filesystem the worker reads (e.g. under ``storage/ingest_snapshots/``)
-before ``StrategyChunkingWorkflow`` starts. Format is versioned so a DB or remote store can replace
+before ``FilesystemCorpusIngestWorkflow`` runs. Format is versioned so a DB or remote store can replace
 the writer later while keeping the same workflow input shape (``ingest_snapshot_path`` only).
 
 Snapshot JSON (version 1)::

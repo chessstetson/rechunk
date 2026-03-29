@@ -79,33 +79,6 @@ def append_chunk_cache(strategy_id: str, content_hash: str, nodes: List[TextNode
         f.write(json.dumps(rec) + "\n")
 
 
-def get_cached_hashes_for_strategy(strategy_id: str) -> List[str]:
-    """
-    Return all content_hash values present in the strategy's cache file.
-    Used by the workflow to skip docs that are already chunked (Phase 2).
-    """
-    path = _strategy_cache_path(strategy_id)
-    if not path.exists():
-        return []
-    hashes_set: set[str] = set()
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                    h = rec.get("content_hash")
-                    if h and isinstance(h, str):
-                        hashes_set.add(h)
-                except json.JSONDecodeError:
-                    continue
-    except OSError:
-        pass
-    return sorted(hashes_set)
-
-
 def load_chunk_cache(strategy_id: str) -> Dict[str, List[TextNode]]:
     """
     Load cached chunks for a strategy, keyed by document content_hash.

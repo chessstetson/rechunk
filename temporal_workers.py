@@ -34,21 +34,14 @@ from temporalio.client import Client
 from temporalio.worker import Worker
 
 from temporal_activities import (
-    chunk_doc_with_builtin_splitter,
-    chunk_doc_with_strategy,
-    get_cached_hashes,
     ingest_filesystem_corpus_from_snapshot,
-    load_doc_manifest,
-    load_manifest_from_ingest_snapshot,
     log_workflow_summary,
-    merge_active_corpus_manifest,
     vectorize_content_for_strategy,
 )
 from temporal_workflows import (
     BatchDocumentVectorizationWorkflow,
     DocumentVectorizationWorkflow,
     FilesystemCorpusIngestWorkflow,
-    StrategyChunkingWorkflow,
 )
 
 
@@ -114,19 +107,12 @@ async def _run_vectorization_worker(client: Client) -> None:
         client,
         task_queue=TASK_QUEUE_VECTORIZATION,
         workflows=[
-            StrategyChunkingWorkflow,
             DocumentVectorizationWorkflow,
             BatchDocumentVectorizationWorkflow,
         ],
         activities=[
-            chunk_doc_with_strategy,
-            chunk_doc_with_builtin_splitter,
-            load_doc_manifest,
-            load_manifest_from_ingest_snapshot,
             vectorize_content_for_strategy,
-            get_cached_hashes,
             log_workflow_summary,
-            merge_active_corpus_manifest,
         ],
         max_concurrent_activities=max_act,
     )

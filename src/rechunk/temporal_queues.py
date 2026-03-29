@@ -2,7 +2,7 @@
 Temporal task queue names.
 
 * **Ingest** — filesystem → ECS + active manifest (no chunking / embeddings).
-* **Vectorization** — Phase C per-hash workflows + legacy batch chunking (needs OpenAI embed + LLM).
+* **Vectorization** — Phase C batch / per-hash vectorization (needs OpenAI embed + LLM for non-builtin strategies).
 """
 
 TASK_QUEUE_INGEST = "rechunk-ingest"

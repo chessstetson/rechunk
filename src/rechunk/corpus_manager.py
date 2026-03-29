@@ -24,8 +24,8 @@ class TemporalIngestHints:
     """
     Legacy workflow inputs: filesystem root and relative document ids.
 
-    Not part of the content-addressed retrieval boundary; used only to start
-    ``StrategyChunkingWorkflow`` until ingest moves to abstract handles.
+    Not part of the content-addressed retrieval boundary; used when starting ingest /
+    vectorization from a filesystem corpus handle (e.g. CLI paths).
     """
 
     docs_root: Path
@@ -41,7 +41,7 @@ class CorpusManager(Protocol):
         ...
 
     def temporal_ingest_hints(self) -> TemporalIngestHints | None:
-        """Return filesystem hints for legacy chunking workflows, or ``None`` if unavailable."""
+        """Return filesystem root + doc ids when enumerating a path corpus, or ``None`` if unavailable."""
         ...
 
     def summary_message(self, content_count: int) -> str:

@@ -1,9 +1,8 @@
 """
 Active corpus manifest: hash-only JSON maintained by ingest (Temporal worker).
 
-After a successful :class:`StrategyChunkingWorkflow` run, the worker merges this
-workflow's manifest ``content_hash`` values into a single sorted deduped list so
-the Q&A CLI can use ``--manifest`` without a manual export step.
+Ingest updates this hash-only artifact from ECS (see ``IndexService.sync_active_manifest_file``).
+The Q&A CLI can use ``--manifest`` to point at the same path without a manual export step.
 
 Path: ``storage/corpus_content_hashes.json`` under project root by default, or
 ``RECHUNK_ACTIVE_CORPUS_MANIFEST`` (absolute or relative path).
