@@ -4,21 +4,23 @@
 
 ## About
 
-Search over private data often qualitatively underperforms public. You know that feeling — you search for an email you know is there, and it eludes you. Each private corpus has idiosyncrasies never seen in public data, and little or no ground truth. A chunking strategy that works beautifully on one corpus fails silently on another.
+Search over private data often underperforms. You know that feeling — you search for an email you know is there, or a particular section you clearly remember from an AI chat, and it eludes you. Each private corpus has idiosyncrasies never seen in public data, and little or no ground truth. A chunking strategy that works beautifully on one corpus fails silently on another.
 
 The usual technique for embedding-based-search is to pick a chunking strategy at setup time and leave it. ReChunk takes a different view: the search index over a private corpus should be adaptive and respond to user feedback.
 
-When retrieval produces a bad answer, ReChunk lets you change how your documents are chunked without a full reindex. New strategies run in parallel with existing ones. The system adapts to failure rather than silently compounding it. ReChunk can use tried-and-tested procedural chunking from LlamaIndex, which it extends — but it can also derive custom chunks using the LLM itself, tuned to the specific structure of ideas in your corpus. Durable execution via Temporal ensures re-indexing is reliable and resumable at scale.
+When retrieval produces a bad answer, ReChunk lets you change how your documents are chunked without a full reindex. New strategies run in parallel with existing ones. The system adapts to failure rather than silently compounding it. ReChunk extends tried-and-tested procedural chunking from LlamaIndex with custom chunks using an LLM itself, tuned to the specific structure of ideas in your corpus. Durable execution via Temporal ensures re-indexing is reliable and resumable at scale.
 
 Built on [LlamaIndex](https://www.llamaindex.ai/) and [Temporal](https://temporal.io/).
 
+ReChunk is still prototype code. Don't rely on it yet.
+
 ### At a glance
 
-- **Index = f(corpus, S)** — the index is a pure function of your documents and a set of chunking strategies.
-- **Strategy layers** — built-in splitters (no LLM), **LLM** strategies (verbatim or multi-span excerpts), and **derived** strategies (synthetic `content` + required `source_spans`). Chunks are tagged by strategy for multi-layer retrieval (v0.2+).
-- **Feedback loop (roadmap)** — poor answers trigger diagnosis and, when the answer exists in the corpus, proposal of new strategies.
+- **Index = f(corpus, S)** — the index is a pure function of your document corpus and a set of chunking strategies (S).
+- **Strategy layers** — built-in splitters (no LLM), **LLM** strategies (verbatim, multi-span excerpts), and **derived** strategies (LLM-aided synthetic `content` + required `source_spans`). Chunks are tagged by strategy for multi-layer retrieval (v0.2+).
+- **Feedback loop (roadmap)** — poor answers trigger diagnosis and proposal of new strategies.
 
-**Derived chunks (high level):** Some strategies use `kind: "derived"` in `rechunk_strategies.json`. The LLM writes **synthetic** chunk text (summaries, bullet lists, obligation-style notes, etc.) optimized for retrieval—not necessarily verbatim excerpts. Every chunk must carry **`source_spans`**: character ranges into the real document so the chunk stays **grounded** and auditable. Rows and caches treat `metadata["source_spans"]` as canonical provenance; see `src/rechunk/derived_metadata.py`, `DerivedNodeParser` in `node_parser.py`, and `tests/test_derived_*.py` for behavior.
+**Derived chunks (high level):** Some strategies use `kind: "derived"` in `rechunk_strategies.json`. The LLM writes **synthetic** chunk text (summaries, bullet lists, obligation-style notes, etc.) optimized for retrieval. Still, every chunk must carry **`source_spans`**: character ranges into the real document so the chunk stays **grounded** and auditable. Rows and caches treat `metadata["source_spans"]` as canonical provenance; see `src/rechunk/derived_metadata.py`, `DerivedNodeParser` in `node_parser.py`, and `tests/test_derived_*.py` for behavior.
 
 Optional **local** docs (not tracked in git): `rechunk_strategy.md` (design / roadmap), `REPOSITORY_DESCRIPTION.md` (GitHub *About* blurb), `TEMPORAL_IMPLEMENTATION_STEPS.md` (implementation checklist).
 
@@ -58,20 +60,11 @@ From the project root (with `OPENAI_API_KEY` set and the package installed, e.g.
 ```bash
 # Interactive helper: verifies Temporal + ReChunk workers first (prints steps if not); --skip-temporal-check to bypass
 # If you omit the path, press Enter (or type demo) for a small Wikipedia subset, or enter your own path
-python scripts/run_interactive.py
 python scripts/run_interactive.py path/to/your/docs
-
-# Chunk a directory of .txt files (or a single .txt file)
-python scripts/run_with_docs.py path/to/your/docs
-
-# Chunk and run a query (with retrieval + LLM feedback: chunks, scores, then answer)
-python scripts/run_with_docs.py path/to/your/docs --query "What is the main idea?"
-
-# Interactive: chunk once, then ask questions in a loop (feel how fast embedding retrieval is)
-python scripts/run_with_docs.py path/to/your/docs --interactive
+or just
+python scripts/run_interactive.py
 ```
 
-Use `docs` for the included sample. With `--query` or `--interactive`, the script shows **retrieval** (embedding cosine similarity, which chunks were picked, timing) and then the **LLM response** (synthesis from those chunks, timing). Options: `--strategy-id`, `--strategy`, `--model`, `--query`, `--interactive`, `--top-k`.
 
 ### Benchmark corpora (Wikipedia, CUAD, PG-19)
 
