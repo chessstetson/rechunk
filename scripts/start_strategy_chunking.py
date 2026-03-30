@@ -17,9 +17,6 @@ Usage:
 Requires Temporal server, **long-running** ``python temporal_workers.py`` in another terminal (that
 process **executes** activities; this script only **starts** a workflow on the server), and
 ``OPENAI_API_KEY`` (embeddings always use OpenAI unless you change the worker).
-
-:class:`DocumentVectorizationWorkflow` (one workflow per hash) remains available for advanced use;
-this script uses the batch workflow only.
 """
 
 import argparse

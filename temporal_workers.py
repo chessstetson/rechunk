@@ -40,7 +40,6 @@ from temporal_activities import (
 )
 from temporal_workflows import (
     BatchDocumentVectorizationWorkflow,
-    DocumentVectorizationWorkflow,
     FilesystemCorpusIngestWorkflow,
 )
 
@@ -106,10 +105,7 @@ async def _run_vectorization_worker(client: Client) -> None:
     worker = Worker(
         client,
         task_queue=TASK_QUEUE_VECTORIZATION,
-        workflows=[
-            DocumentVectorizationWorkflow,
-            BatchDocumentVectorizationWorkflow,
-        ],
+        workflows=[BatchDocumentVectorizationWorkflow],
         activities=[
             vectorize_content_for_strategy,
             log_workflow_summary,

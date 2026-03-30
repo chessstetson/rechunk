@@ -218,7 +218,6 @@ flowchart TD
 
     subgraph qv ["Task queue: rechunk-strategy-chunking\n(OPENAI_API_KEY required)"]
         WBV["BatchDocumentVectorizationWorkflow\nwaved asyncio.gather\nfanout_batch_size=32 configurable\nmax_concurrent_activities=8 configurable"]
-        WDV["DocumentVectorizationWorkflow\nsingle-hash variant"]
         AV["vectorize_content_for_strategy\nbuiltin / llm / derived\nreads ECS · writes VectorStore rows\ndual-writes JSONL cache"]
         ALG["log_workflow_summary"]
     end
@@ -234,7 +233,7 @@ flowchart TD
     AV <-->|get_worker_ecs / get_worker_vector_store| WR
 ```
 
-The two task queues and what runs on each. The ingest queue requires no API keys and only writes to ExtractedContentService. The vectorization queue requires OPENAI_API_KEY and runs ``vectorize_content_for_strategy`` (chunk + embed + VectorStore rows) under ``BatchDocumentVectorizationWorkflow`` or per-hash ``DocumentVectorizationWorkflow``.
+The two task queues and what runs on each. The ingest queue requires no API keys and only writes to ExtractedContentService. The vectorization queue requires OPENAI_API_KEY and runs ``vectorize_content_for_strategy`` (chunk + embed + VectorStore rows) under ``BatchDocumentVectorizationWorkflow``.
 
 ## Roadmap
 

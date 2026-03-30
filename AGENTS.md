@@ -23,7 +23,7 @@ Short orientation for humans and coding agents working on **ReChunk**.
 Defined in `src/rechunk/temporal_queues.py`:
 
 - **`rechunk-ingest`** — filesystem → ECS + manifest (`FilesystemCorpusIngestWorkflow`).
-- **`rechunk-strategy-chunking`** — chunk + embed + `VectorStore.upsert_rows` (`BatchDocumentVectorizationWorkflow`, etc.).
+- **`rechunk-strategy-chunking`** — chunk + embed + `VectorStore.upsert_rows` (`BatchDocumentVectorizationWorkflow`).
 
 Workers: `python temporal_workers.py` (both queues) or `ingest` / `vectorization` subcommands.
 

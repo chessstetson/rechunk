@@ -54,35 +54,6 @@ class FilesystemCorpusIngestWorkflow:
 
 
 @workflow.defn
-class DocumentVectorizationWorkflow:
-    """
-    Phase C: vectorize a single ``content_hash`` with one strategy via ECS + VectorStore.
-    """
-
-    @workflow.run
-    async def run(self, input: DocumentVectorizationInput) -> dict:
-        result: dict = await workflow.execute_activity(
-            "vectorize_content_for_strategy",
-            input,
-            start_to_close_timeout=timedelta(minutes=15),
-        )
-        status = result.get("status", "unknown")
-        skipped = 1 if status == "skipped" else 0
-        processed = 1 if status == "processed" else 0
-        await workflow.execute_activity(
-            "log_workflow_summary",
-            LogWorkflowSummaryInput(
-                strategy_id=input.strategy_id,
-                total=1,
-                skipped=skipped,
-                processed=processed,
-            ),
-            start_to_close_timeout=timedelta(seconds=10),
-        )
-        return result
-
-
-@workflow.defn
 class BatchDocumentVectorizationWorkflow:
     """
     Single orchestration workflow: one ``vectorize_content_for_strategy`` activity per content hash.
