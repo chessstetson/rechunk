@@ -44,12 +44,12 @@ Requires Python 3.10+. Set `OPENAI_API_KEY` for embeddings, LLM chunking, and CL
 4. **API key** — `export OPENAI_API_KEY=...` in the shells where you run workers and interactive scripts.
 5. **Sanity check** — `python scripts/rechunk_doctor.py` (use `--strict` in CI if you want failure when Temporal is down or the key is missing).
 6. **Worker** — in one terminal: `python temporal_workers.py` (polls ingest + vectorization queues).
-7. **Ingest + query** — in another: `python scripts/run_interactive.py path/to/your/docs` (ingests into ECS, queues vectorization, then Q&A). Or run ingest + chunking explicitly (see **Temporal** below).
+7. **Ingest + query** — in another: `python scripts/run_interactive.py path/to/your/docs` (ingests into Extracted Content Service, aka ECS, queues vectorization, then Q&A). Or run ingest + chunking explicitly (see **Temporal** below).
 
 **Common issues**
 
 - **Empty or stale index** — worker not running, or vectorization still in flight; wait for workflows or check Temporal UI. Ensure the same `RECHUNK_OPENAI_EMBEDDING_MODEL` (if set) is used for workers and CLI index build.
-- **Strategies file** — `rechunk_strategies.json` must exist and list the `strategy_id` you pass to chunking scripts; see the example file.
+- **Strategies file** — `rechunk_strategies.json` must list the `strategy_id` you pass to chunking scripts (the CLI can create defaults on first use).
 
 Environment variables are summarized in **AGENTS.md**.
 
@@ -60,9 +60,8 @@ From the project root (with `OPENAI_API_KEY` set and the package installed, e.g.
 ```bash
 # Interactive helper: verifies Temporal + ReChunk workers first (prints steps if not); --skip-temporal-check to bypass
 # If you omit the path, press Enter (or type demo) for a small Wikipedia subset, or enter your own path
-python scripts/run_interactive.py path/to/your/docs
-or just
 python scripts/run_interactive.py
+python scripts/run_interactive.py path/to/your/docs
 ```
 
 
@@ -132,11 +131,11 @@ flowchart TD
     subgraph strat ["Strategy kinds — rechunk_strategies.json"]
         S1["builtin_splitter\nSentenceSplitter / TokenTextSplitter"]
         S2["llm\nLLMNodeParser — verbatim chunks"]
-        S3["derived\nDerivedNodeParser — synthetic text\n+ source_spans provenance"]
+        S3["derived\nDerivedNodeParser\nsynthetic text + source_spans"]
     end
 
     subgraph fp ["Key derivation — fingerprints.py"]
-        FP["strategy_fingerprint\nembedding_fingerprint"]
+        FP["strategy_fingerprint · embedding_fingerprint"]
     end
 
     CLI --> IS
@@ -152,7 +151,7 @@ flowchart TD
     ECS --- ECSS
     VS --- VSS
 ```
-The main building blocks and how they relate. IndexService is the single entry point for clients; ExtractedContentService owns all document content; VectorStore holds the chunked, embedded rows and assembled retrieval indexes. Chunker and corpus_snapshot_id live inside the IndexService layer and are never called directly by clients.
+The main building blocks and how they relate. IndexService is the single entry point for clients. ExtractedContentService (ECS) is the source of truth for all document content and active corpus membership. VectorStore holds chunked, embedded rows and assembled retrieval collections. Chunker and corpus_snapshot_id live inside the IndexService layer and are never called directly by clients. Three strategy kinds are supported: builtin_splitter, llm, and derived.
 
 ### Data flow
 
@@ -170,20 +169,20 @@ flowchart TD
 
     subgraph vec ["② Vectorize  —  rechunk-strategy-chunking queue"]
         DIFF["Chunker.list_pending\ndiff ECS active hashes vs vectorized rows"]
-        WFV["BatchDocumentVectorizationWorkflow\nwaved asyncio.gather — fanout_batch_size=32"]
+        WFV["BatchDocumentVectorizationWorkflow\nwaved asyncio.gather · fanout_batch_size=32"]
         ACT_V["vectorize_content_for_strategy"]
         P1["builtin_splitter\nSentenceSplitter / TokenTextSplitter"]
-        P2["llm\nLLMNodeParser — verbatim chunks"]
+        P2["llm\nLLMNodeParser"]
         P3["derived\nDerivedNodeParser\nsynthetic text + source_spans"]
-        SPANS["ensure_metadata_source_spans_for_nodes\nderived_metadata.py"]
-        EMBED["OpenAI embed_model\nget_text_embedding_batch"]
-        ROWS["VectorStore.upsert_rows\nembedding · metadata · chunk_text"]
-        CACHE["append_chunk_cache\n(JSONL — dual-write bridge)"]
+        SPANS["ensure_metadata_source_spans_for_nodes"]
+        EMBED["OpenAI get_text_embedding_batch"]
+        ROWS["VectorStore.upsert_rows"]
+        CACHE["append_chunk_cache\n(JSONL dual-write)"]
     end
 
     subgraph query ["③ Query"]
-        CSI["compute_corpus_snapshot_id\nSHA-256 of sorted active hashes"]
-        COL["VectorStore.get_collection\ncached LlamaIndex index"]
+        CSI["compute_corpus_snapshot_id"]
+        COL["VectorStore.get_collection"]
         RAG["retrieve_top_k + synthesize"]
     end
 
@@ -193,17 +192,15 @@ flowchart TD
     ACT_V -->|get_content| ECS
     ACT_V --> P1 & P2 & P3
     P3 --> SPANS
-    P1 & P2 & SPANS --> EMBED
-    EMBED --> ROWS
+    P1 & P2 & SPANS --> EMBED --> ROWS
     ACT_V --> CACHE
-
     ECS -->|list_active_hashes| CSI
     CSI --> COL
     ROWS -->|assembled per corpus_snapshot_id| COL
     COL --> RAG
 ```
 
-How a document moves through the system end to end. Ingest and vectorization run on separate Temporal queues and can proceed independently. The three strategy kinds — builtin_splitter, llm, and derived — all converge on the same embedding and storage step. At query time, the active corpus is fingerprinted on the fly into a corpus_snapshot_id that keys the cached vector collection.
+How a document moves through the system end to end. Ingest and vectorization run on separate Temporal queues and proceed independently. Inside vectorization, all three strategy kinds converge on the same embedding and storage step. At query time, the active corpus is fingerprinted on the fly into a corpus_snapshot_id that keys the cached vector collection — no snapshot object is ever stored.
 
 ### Temporal layer
 
@@ -213,11 +210,11 @@ flowchart TD
 
     subgraph qi ["Task queue: rechunk-ingest\n(no OpenAI key required)"]
         WI["FilesystemCorpusIngestWorkflow"]
-        AI["ingest_filesystem_corpus_from_snapshot\n→ ECS + active manifest"]
+        AI["ingest_filesystem_corpus_from_snapshot\n→ writes ECS + active manifest"]
     end
 
     subgraph qv ["Task queue: rechunk-strategy-chunking\n(OPENAI_API_KEY required)"]
-        WBV["BatchDocumentVectorizationWorkflow\nwaved asyncio.gather\nfanout_batch_size=32 configurable\nmax_concurrent_activities=8 configurable"]
+        WBV["BatchDocumentVectorizationWorkflow\nwaved asyncio.gather\nfanout_batch_size & max_concurrent_activities configurable"]
         AV["vectorize_content_for_strategy\nbuiltin / llm / derived\nreads ECS · writes VectorStore rows\ndual-writes JSONL cache"]
         ALG["log_workflow_summary"]
     end
@@ -229,11 +226,10 @@ flowchart TD
     TC --> WI & WBV
     WI --> AI
     WBV --> AV & ALG
-    WDV --> AV & ALG
     AV <-->|get_worker_ecs / get_worker_vector_store| WR
 ```
 
-The two task queues and what runs on each. The ingest queue requires no API keys and only writes to ExtractedContentService. The vectorization queue requires OPENAI_API_KEY and runs ``vectorize_content_for_strategy`` (chunk + embed + VectorStore rows) under ``BatchDocumentVectorizationWorkflow``.
+The two task queues and what runs on each. The ingest queue requires no API keys and writes to ExtractedContentService and the active manifest. The vectorization queue requires `OPENAI_API_KEY` and runs ``vectorize_content_for_strategy`` (chunk + embed + VectorStore rows) under ``BatchDocumentVectorizationWorkflow``. Concurrency is controlled by ``RECHUNK_BATCH_VECTORIZATION_FANOUT`` (per workflow wave) and ``RECHUNK_MAX_CONCURRENT_ACTIVITIES`` (per worker process). Both queues can run in a single ``temporal_workers.py`` process for local development or as separate worker processes in production.
 
 ## Roadmap
 
